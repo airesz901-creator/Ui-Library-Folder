@@ -1,4 +1,4 @@
-local Release = "Luna Final 7.0.7 - No Key System"
+local Release = "Luna Final 7.0.8 - No Key System"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -2428,12 +2428,31 @@ end
 -- Interface Management
 local LunaUI = game:GetObjects("rbxassetid://86467455075715")[1]
 
-local SizeBleh = nil
+local SavedWindowVisibilityState = setmetatable({}, {__mode = "k"})
+local LastHideNotificationAt = setmetatable({}, {__mode = "k"})
 
-local function Hide(Window, bind, notif)
-	SizeBleh = Window.Size
-	local bindName = InputBindingName(bind) or "Unassigned"
-	if notif then
+local function Hide(Window, bind, notif, notificationCooldown)
+	if not Window then
+		return false
+	end
+
+	SavedWindowVisibilityState[Window] = {
+		Size = Window.Size,
+		ElementsVisible = Window.Elements.Visible,
+		NavigationVisible = Window.Navigation.Visible,
+	}
+
+	local now = os.clock()
+	local cooldown = math.max(
+		0,
+		tonumber(notificationCooldown) or 1.5
+	)
+	local lastNotification = LastHideNotificationAt[Window] or -math.huge
+	local shouldNotify = notif and (now - lastNotification >= cooldown)
+
+	if shouldNotify then
+		LastHideNotificationAt[Window] = now
+		local bindName = InputBindingName(bind) or "Unassigned"
 		Luna:Notification({
 			Title = "Interface Hidden",
 			Content = "Press the minimize keybind (" .. bindName .. ") to reopen the interface.",
@@ -2441,37 +2460,55 @@ local function Hide(Window, bind, notif)
 			ImageSource = "Material",
 		})
 	end
-	tween(Window, {BackgroundTransparency = 1})
-	tween(Window.Elements, {BackgroundTransparency = 1})
-	tween(Window.Line, {BackgroundTransparency = 1})
-	tween(Window.Title.Title, {TextTransparency = 1})
-	tween(Window.Title.subtitle, {TextTransparency = 1})
-	tween(Window.Logo, {ImageTransparency = 1})
-	tween(Window.Navigation.Line, {BackgroundTransparency = 1})
+
+	-- Full hide is intentionally instant. No delayed task is left behind,
+	-- so rapid minimize/restore inputs cannot finish out of order.
+	Window.BackgroundTransparency = 1
+	Window.Elements.BackgroundTransparency = 1
+	Window.Line.BackgroundTransparency = 1
+	Window.Title.Title.TextTransparency = 1
+	Window.Title.subtitle.TextTransparency = 1
+	Window.Logo.ImageTransparency = 1
+	Window.Navigation.Line.BackgroundTransparency = 1
 
 	for _, TopbarButton in ipairs(Window.Controls:GetChildren()) do
 		if TopbarButton.ClassName == "Frame" then
-			tween(TopbarButton, {BackgroundTransparency = 1})
-			tween(TopbarButton.UIStroke, {Transparency = 1})
-			tween(TopbarButton.ImageLabel, {ImageTransparency = 1})
+			TopbarButton.BackgroundTransparency = 1
+			if TopbarButton:FindFirstChild("UIStroke") then
+				TopbarButton.UIStroke.Transparency = 1
+			end
+			if TopbarButton:FindFirstChild("ImageLabel") then
+				TopbarButton.ImageLabel.ImageTransparency = 1
+			end
 			TopbarButton.Visible = false
 		end
 	end
+
 	for _, tabbtn in ipairs(Window.Navigation.Tabs:GetChildren()) do
 		if tabbtn.ClassName == "Frame" and tabbtn.Name ~= "InActive Template" then
-			TweenService:Create(tabbtn, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 1}):Play()
-			TweenService:Create(tabbtn.ImageLabel, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {ImageTransparency = 1}):Play()
-			TweenService:Create(tabbtn.DropShadowHolder.DropShadow, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {ImageTransparency = 1}):Play()
-			TweenService:Create(tabbtn.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
+			tabbtn.BackgroundTransparency = 1
+			if tabbtn:FindFirstChild("ImageLabel") then
+				tabbtn.ImageLabel.ImageTransparency = 1
+			end
+			if tabbtn:FindFirstChild("UIStroke") then
+				tabbtn.UIStroke.Transparency = 1
+			end
+			local shadowHolder = tabbtn:FindFirstChild("DropShadowHolder")
+			local shadow = shadowHolder and shadowHolder:FindFirstChild("DropShadow")
+			if shadow then
+				shadow.ImageTransparency = 1
+			end
 		end
 	end
 
-	task.wait(0.28)
-	Window.Size = UDim2.new(0,0,0,0)
-	Window.Parent.ShadowHolder.Visible = false
-	task.wait()
-	Window.Elements.Parent.Visible = false
+	Window.Size = UDim2.fromOffset(0, 0)
+	local parent = Window.Parent
+	local shadowHolder = parent and parent:FindFirstChild("ShadowHolder")
+	if shadowHolder then
+		shadowHolder.Visible = false
+	end
 	Window.Visible = false
+	return true
 end
 
 
@@ -2828,37 +2865,69 @@ function Luna:Notification(data) -- action e.g open messages
 end
 
 local function Unhide(Window, currentTab)
-	Window.Size = SizeBleh
-	Window.Elements.Visible = true
+	if not Window then
+		return false
+	end
+
+	local saved = SavedWindowVisibilityState[Window]
+	if saved and saved.Size then
+		Window.Size = saved.Size
+	end
+
 	Window.Visible = true
-	task.wait()
-	tween(Window, {BackgroundTransparency = 0.2})
-	tween(Window.Elements, {BackgroundTransparency = 0.08})
-	tween(Window.Line, {BackgroundTransparency = 0})
-	tween(Window.Title.Title, {TextTransparency = 0})
-	tween(Window.Title.subtitle, {TextTransparency = 0})
-	tween(Window.Logo, {ImageTransparency = 0})
-	tween(Window.Navigation.Line, {BackgroundTransparency = 0})
+	Window.Elements.Visible =
+		not saved or saved.ElementsVisible ~= false
+	Window.Navigation.Visible =
+		not saved or saved.NavigationVisible ~= false
+
+	local parent = Window.Parent
+	local shadowHolder = parent and parent:FindFirstChild("ShadowHolder")
+	if shadowHolder then
+		shadowHolder.Visible = true
+	end
+
+	-- Restore every visual property synchronously. This cancels the old
+	-- delayed hide behavior and keeps the final state deterministic.
+	Window.BackgroundTransparency = 0.2
+	Window.Elements.BackgroundTransparency = 0.08
+	Window.Line.BackgroundTransparency = 0
+	Window.Title.Title.TextTransparency = 0
+	Window.Title.subtitle.TextTransparency = 0
+	Window.Logo.ImageTransparency = 0
+	Window.Navigation.Line.BackgroundTransparency = 0
 
 	for _, TopbarButton in ipairs(Window.Controls:GetChildren()) do
 		if TopbarButton.ClassName == "Frame" and TopbarButton.Name ~= "Theme" then
 			TopbarButton.Visible = true
-			tween(TopbarButton, {BackgroundTransparency = 0.25})
-			tween(TopbarButton.UIStroke, {Transparency = 0.5})
-			tween(TopbarButton.ImageLabel, {ImageTransparency = 0.25})
-		end
-	end
-	for _, tabbtn in ipairs(Window.Navigation.Tabs:GetChildren()) do
-		if tabbtn.ClassName == "Frame" and tabbtn.Name ~= "InActive Template" then
-			if tabbtn.Name == currentTab then
-				TweenService:Create(tabbtn, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-				TweenService:Create(tabbtn.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 0.41}):Play()
+			TopbarButton.BackgroundTransparency = 0.25
+			if TopbarButton:FindFirstChild("UIStroke") then
+				TopbarButton.UIStroke.Transparency = 0.5
 			end
-			TweenService:Create(tabbtn.ImageLabel, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {ImageTransparency = 0}):Play()
-			TweenService:Create(tabbtn.DropShadowHolder.DropShadow, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {ImageTransparency = 1}):Play()
+			if TopbarButton:FindFirstChild("ImageLabel") then
+				TopbarButton.ImageLabel.ImageTransparency = 0.25
+			end
 		end
 	end
 
+	for _, tabbtn in ipairs(Window.Navigation.Tabs:GetChildren()) do
+		if tabbtn.ClassName == "Frame" and tabbtn.Name ~= "InActive Template" then
+			local active = tabbtn.Name == currentTab
+			tabbtn.BackgroundTransparency = active and 0 or 1
+			if tabbtn:FindFirstChild("UIStroke") then
+				tabbtn.UIStroke.Transparency = active and 0.41 or 1
+			end
+			if tabbtn:FindFirstChild("ImageLabel") then
+				tabbtn.ImageLabel.ImageTransparency = 0
+			end
+			local tabShadowHolder = tabbtn:FindFirstChild("DropShadowHolder")
+			local shadow = tabShadowHolder and tabShadowHolder:FindFirstChild("DropShadow")
+			if shadow then
+				shadow.ImageTransparency = 1
+			end
+		end
+	end
+
+	return true
 end
 
 local MainSize
@@ -2873,16 +2942,18 @@ end
 
 local function Maximise(Window)
 	Window.Controls.ToggleSize.ImageLabel.Image = "rbxassetid://10137941941"
-	tween(Window, {Size = MainSize})
+	Window.Size = MainSize
 	Window.Elements.Visible = true
 	Window.Navigation.Visible = true
+	return true
 end
 
 local function Minimize(Window)
 	Window.Controls.ToggleSize.ImageLabel.Image = "rbxassetid://11036884234"
 	Window.Elements.Visible = false
 	Window.Navigation.Visible = false
-	tween(Window, {Size = MinSize})
+	Window.Size = MinSize
+	return true
 end
 
 
@@ -2910,6 +2981,7 @@ function Luna:CreateWindow(WindowSettings)
 		Enabled = true,
 		Keybind = Enum.KeyCode.RightShift,
 		ShowNotification = true,
+		NotificationCooldown = 1.5,
 	}, WindowSettings.MinimizeSettings or {})
 
 	if WindowSettings.ConfigSettings.RootFolder ~= nil and WindowSettings.ConfigSettings.RootFolder ~= "" then
@@ -2933,6 +3005,10 @@ function Luna:CreateWindow(WindowSettings)
 		MinimizeBind = minimizeBinding,
 		MinimizeEnabled = WindowSettings.MinimizeSettings.Enabled ~= false,
 		MinimizeShowNotification = WindowSettings.MinimizeSettings.ShowNotification ~= false,
+		MinimizeNotificationCooldown = math.max(
+			0,
+			tonumber(WindowSettings.MinimizeSettings.NotificationCooldown) or 1.5
+		),
 		CurrentTab = nil,
 		State = true,
 		Size = false,
@@ -7308,33 +7384,45 @@ function Luna:CreateWindow(WindowSettings)
 	end
 
 	local function HideWindow()
-		if Luna._Destroyed or not Window.State then return end
+		if Luna._Destroyed or not Window.State then
+			return false
+		end
+
+		-- Commit logical state before touching visuals so a second input
+		-- always sees the newest state, even when keys are spammed.
+		Window.State = false
+		dragBar.Visible = false
+
 		Hide(
 			Main,
 			Window.MinimizeBind,
-			Window.MinimizeShowNotification
+			Window.MinimizeShowNotification,
+			Window.MinimizeNotificationCooldown
 		)
-		dragBar.Visible = false
-		Window.State = false
+
 		if UserInputService.KeyboardEnabled == false then
 			LunaUI.MobileSupport.Visible = true
 		end
+		return true
 	end
 
 	local function ShowWindow()
-		if Luna._Destroyed or Window.State then return end
-		Unhide(Main, Window.CurrentTab)
+		if Luna._Destroyed or Window.State then
+			return false
+		end
+
+		Window.State = true
 		LunaUI.MobileSupport.Visible = false
 		dragBar.Visible = true
-		Window.State = true
+		Unhide(Main, Window.CurrentTab)
+		return true
 	end
 
 	local function ToggleWindowVisibility()
 		if Window.State then
-			HideWindow()
-		else
-			ShowWindow()
+			return HideWindow()
 		end
+		return ShowWindow()
 	end
 
 	local function CloseWindow()
@@ -7462,18 +7550,18 @@ function Luna:CreateWindow(WindowSettings)
 	end
 
 	function Window:ToggleVisibility()
-		ToggleWindowVisibility()
+		return ToggleWindowVisibility()
 	end
 
 	function Window:Minimize()
-		HideWindow()
+		return HideWindow()
 	end
 
 	function Window:Restore()
-		ShowWindow()
+		return ShowWindow()
 	end
 
-	function Window:Hide() HideWindow() end
+	function Window:Hide() return HideWindow() end
 	function Window:Close() CloseWindow() end
 	function Window:Destroy() CloseWindow() end
 	function Window:DestroyLibrary() CloseWindow() end
