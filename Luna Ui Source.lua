@@ -1,10 +1,11 @@
-local Release = "Luna Final 7.0.6 - No Key System"
+local Release = "Luna Final 7.0.7 - No Key System"
 
 local Luna = { 
 	Folder = "Luna", 
 	Options = {}, 
 	ThemeGradient = ColorSequence.new{ColorSequenceKeypoint.new(0.00, Color3.fromRGB(117, 164, 206)), ColorSequenceKeypoint.new(0.50, Color3.fromRGB(123, 201, 201)), ColorSequenceKeypoint.new(1.00, Color3.fromRGB(224, 138, 175))},
-	ConfigVersion = 4,
+	ConfigVersion = 5,
+	ConfigExtension = ".json",
 	Version = Release,
 	MaxNotifications = 3,
 }
@@ -31,6 +32,7 @@ Luna._Stats = {
 	NotificationsCreated = 0,
 	ActiveNotifications = 0,
 	RenderLoops = 0,
+	DuplicateFlags = 0,
 }
 
 local function TrackConnection(connection, bucket)
@@ -111,15 +113,139 @@ local function EnsureFolderPath(path)
 	return true
 end
 
-local function RegisterOption(flag, option)
-	if flag then
-		if Luna.Options[flag] and Luna.Options[flag] ~= option then
-			warn(("Luna UI: duplicate config flag %q was replaced."):format(tostring(flag)))
-		end
-		Luna.Options[flag] = option
-		option.Flag = flag
+
+local MouseButtonAliases = {
+	M1 = "MouseButton1",
+	MOUSE1 = "MouseButton1",
+	LEFTMOUSE = "MouseButton1",
+	M2 = "MouseButton2",
+	MOUSE2 = "MouseButton2",
+	RIGHTMOUSE = "MouseButton2",
+	M3 = "MouseButton3",
+	MOUSE3 = "MouseButton3",
+	MIDDLEMOUSE = "MouseButton3",
+}
+
+local AllowedUserInputBinds = {
+	[Enum.UserInputType.MouseButton1] = true,
+	[Enum.UserInputType.MouseButton2] = true,
+	[Enum.UserInputType.MouseButton3] = true,
+}
+
+local function NormalizeInputBinding(value, fallback)
+	if value == nil and fallback ~= nil then
+		value = fallback
 	end
-	return option
+
+	if type(value) == "table" then
+		value = value.EnumItem or value.Name or value.Keybind or value.Bind
+	end
+
+	if typeof(value) == "EnumItem" then
+		if value.EnumType == Enum.KeyCode and value ~= Enum.KeyCode.Unknown then
+			return {
+				Kind = "KeyCode",
+				Name = value.Name,
+				EnumItem = value,
+			}
+		end
+
+		if value.EnumType == Enum.UserInputType and AllowedUserInputBinds[value] then
+			return {
+				Kind = "UserInputType",
+				Name = value.Name,
+				EnumItem = value,
+			}
+		end
+
+		return nil, "Only keyboard, gamepad, and mouse buttons are supported."
+	end
+
+	local name = tostring(value or "")
+	name = name:gsub("^Enum%.KeyCode%.", "")
+	name = name:gsub("^Enum%.UserInputType%.", "")
+	name = name:gsub("%s+", "")
+
+	local alias = MouseButtonAliases[name:upper()]
+	if alias then
+		name = alias
+	end
+
+	local keyCode = Enum.KeyCode[name]
+	if keyCode and keyCode ~= Enum.KeyCode.Unknown then
+		return {
+			Kind = "KeyCode",
+			Name = name,
+			EnumItem = keyCode,
+		}
+	end
+
+	local inputType = Enum.UserInputType[name]
+	if inputType and AllowedUserInputBinds[inputType] then
+		return {
+			Kind = "UserInputType",
+			Name = name,
+			EnumItem = inputType,
+		}
+	end
+
+	return nil, ("Unsupported input bind %q."):format(tostring(value))
+end
+
+local function InputBindingName(value)
+	local binding = NormalizeInputBinding(value)
+	return binding and binding.Name or nil
+end
+
+local function InputToBinding(input)
+	if not input then
+		return nil
+	end
+
+	if input.KeyCode and input.KeyCode ~= Enum.KeyCode.Unknown then
+		return NormalizeInputBinding(input.KeyCode)
+	end
+
+	if input.UserInputType and AllowedUserInputBinds[input.UserInputType] then
+		return NormalizeInputBinding(input.UserInputType)
+	end
+
+	return nil
+end
+
+local function InputMatchesBinding(input, value)
+	local binding = NormalizeInputBinding(value)
+	if not binding or not input then
+		return false
+	end
+
+	if binding.Kind == "KeyCode" then
+		return input.KeyCode == binding.EnumItem
+	end
+
+	return input.UserInputType == binding.EnumItem
+end
+
+local function RegisterOption(flag, option)
+	if not flag then
+		return true
+	end
+
+	flag = tostring(flag)
+	local existing = Luna.Options[flag]
+
+	if existing and existing ~= option then
+		Luna._Stats.DuplicateFlags += 1
+		option.IgnoreConfig = true
+		option.ConfigRegistrationError =
+			("Duplicate config flag %q was rejected."):format(flag)
+		warn("Luna UI: " .. option.ConfigRegistrationError)
+		return false, option.ConfigRegistrationError
+	end
+
+	Luna.Options[flag] = option
+	option.Flag = flag
+	return true
 end
 
 local function RemoveOption(option)
@@ -275,6 +401,7 @@ function Luna:GetDiagnostics()
 		CallbackErrors = Luna._Stats.CallbackErrors,
 		NotificationsCreated = Luna._Stats.NotificationsCreated,
 		ActiveNotifications = Luna._Stats.ActiveNotifications,
+		DuplicateFlags = Luna._Stats.DuplicateFlags,
 		MaxNotifications = Luna.MaxNotifications,
 		ConfigVersion = Luna.ConfigVersion,
 	}
@@ -2305,10 +2432,14 @@ local SizeBleh = nil
 
 local function Hide(Window, bind, notif)
 	SizeBleh = Window.Size
-	bind = string.split(tostring(bind), "Enum.KeyCode.")
-	bind = bind[2]
+	local bindName = InputBindingName(bind) or "Unassigned"
 	if notif then
-		Luna:Notification({Title = "Interface Hidden", Content = "The interface has been hidden, you may reopen the interface by Pressing the UI Bind In Settings ("..tostring(bind)..")", Icon = "visibility_off"})
+		Luna:Notification({
+			Title = "Interface Hidden",
+			Content = "Press the minimize keybind (" .. bindName .. ") to reopen the interface.",
+			Icon = "visibility_off",
+			ImageSource = "Material",
+		})
 	end
 	tween(Window, {BackgroundTransparency = 1})
 	tween(Window.Elements, {BackgroundTransparency = 1})
@@ -2393,89 +2524,7 @@ if LegacyKeyGate then
 	LegacyKeyGate:Destroy()
 end
 
--- local function LoadConfiguration(Configuration, autoload)
--- 	local Data = HttpService:JSONDecode(Configuration)
--- 	local changed
--- 	local notified = false
-
--- 	-- Iterate through current UI elements' flags
--- 	for FlagName, Flag in pairs(Luna.Flags) do
--- 		local FlagValue = Data[FlagName]
-
--- 		if FlagValue then
--- 			task.spawn(function()
--- 				if Flag.Type == "ColorPicker" then
--- 					changed = true
--- 					Flag:Set(UnpackColor(FlagValue))
--- 				else
--- 					if (Flag.CurrentValue or Flag.CurrentKeybind or Flag.CurrentOption or Flag.Color) ~= FlagValue then 
--- 						changed = true
--- 						Flag:Set(FlagValue) 	
--- 					end
--- 				end
--- 			end)
--- 		else
--- 			notified = true
--- 			Luna:Notification({Title = "Config Error", Content = "Luna was unable to load or find '"..FlagName.. "'' in the current script. Check ".. website .." for help.", Icon = "flag"})
--- 		end
--- 	end
--- 	if autoload and notified == false then
--- 		Luna:Notification({
--- 			Title = "Config Autoloaded",
--- 			Content = "The Configuration Has Been Automatically Loaded. Thank You For Using Luna Library",
--- 			Icon = "file-code-2",
--- 			ImageSource = "Lucide"
--- 		})
--- 	elseif notified == false then
--- 		Luna:Notification({
--- 			Title = "Config Loaded",
--- 			Content = "The Configuration Has Been Loaded. Thank You For Using Luna Library",
--- 			Icon = "file-code-2",
--- 			ImageSource = "Lucide"
--- 		})
--- 	end
-
--- 	return changed
--- end
-
--- local function SaveConfiguration(Configuration, ConfigFolder, hasRoot)
--- 	local Data = {}
--- 	for i,v in pairs(Luna.Flags) do
--- 		if v.Type == "ColorPicker" then
--- 			Data[i] = PackColor(v.Color)
--- 		else
--- 			Data[i] = v.CurrentValue or v.CurrentBind or v.CurrentOption or v.Color
--- 		end
--- 	end	
--- 	if hasRoot then
--- 		writefile(ConfigurationFolder .. "/" .. hasRoot .. "/" .. ConfigFolder .. "/" .. Configuration .. ConfigurationExtension, tostring(HttpService:JSONEncode(Data)))
--- 	else
--- 		writefile(ConfigurationFolder .. "/" .. "/" .. ConfigFolder .. Configuration .. ConfigurationExtension, tostring(HttpService:JSONEncode(Data)))
--- 	end
--- end
-
--- local function SetAutoload(ConfigName, ConfigFolder, hasRoot)
--- 	if hasRoot then
--- 		writefile(ConfigurationFolder .. "/" .. hasRoot .. "/" .. ConfigFolder .. "/" .. "autoload.txt", tostring(ConfigName) .. ConfigurationExtension)
--- 	else
--- 		writefile(ConfigurationFolder .. "/" .. "/" .. ConfigFolder .. "autoload.txt", tostring(ConfigName) .. ConfigurationExtension)
--- 	end
--- end
-
--- local function LoadAutoLoad(ConfigFolder, hasRoot)
--- 	local autoload = isfile(ConfigurationFolder .. "/" .. "/" .. ConfigFolder .. "autoload.txt")
--- 	if hasRoot then
--- 		autoload = isfile(ConfigurationFolder .. "/" .. hasRoot .. "/" .. ConfigFolder .. "/" .. "autoload.txt")
--- 	end
-
--- 	if autoload then
--- 		if hasRoot then
--- 			LoadConfiguration(readfile(ConfigurationFolder .. "/" .. hasRoot .. "/" .. ConfigFolder .. "/" .. readfile(ConfigurationFolder .. "/" .. hasRoot .. "/" .. ConfigFolder .. "/" .. "autoload.txt")), true)
--- 		else
--- 			LoadConfiguration(readfile(ConfigurationFolder .. "/" .. ConfigFolder .. "/" .. readfile(ConfigurationFolder .. "/" .. ConfigFolder .. "/" .. "autoload.txt")), true)
--- 		end
--- 	end
--- end
+-- Legacy configuration code removed. JSON config v5 is defined below.
 
 local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 	if not Bar or not Window then return function() end end
@@ -2848,14 +2897,20 @@ function Luna:CreateWindow(WindowSettings)
 		LoadingTitle = "Luna Interface Suite",
 		LoadingSubtitle = "by Nebula Softworks",
 
-		ConfigSettings = {}
+		ConfigSettings = {},
+		MinimizeSettings = {},
 	}, WindowSettings or {})
 
 	WindowSettings.ConfigSettings = Kwargify({
 		RootFolder = nil,
-		ConfigFolder = "Big Hub"
+		ConfigFolder = "Big Hub",
 	}, WindowSettings.ConfigSettings or {})
 
+	WindowSettings.MinimizeSettings = Kwargify({
+		Enabled = true,
+		Keybind = Enum.KeyCode.RightShift,
+		ShowNotification = true,
+	}, WindowSettings.MinimizeSettings or {})
 
 	if WindowSettings.ConfigSettings.RootFolder ~= nil and WindowSettings.ConfigSettings.RootFolder ~= "" then
 		Luna.Folder = tostring(WindowSettings.ConfigSettings.RootFolder) .. "/" .. tostring(WindowSettings.ConfigSettings.ConfigFolder)
@@ -2863,7 +2918,26 @@ function Luna:CreateWindow(WindowSettings)
 		Luna.Folder = tostring(WindowSettings.ConfigSettings.ConfigFolder)
 	end
 
-	local Window = { Bind = Enum.KeyCode.K, CurrentTab = nil, State = true, Size = false, Settings = nil }
+	local minimizeBinding, minimizeBindingError = NormalizeInputBinding(
+		WindowSettings.MinimizeSettings.Keybind,
+		Enum.KeyCode.RightShift
+	)
+
+	if not minimizeBinding then
+		warn("Luna UI: " .. tostring(minimizeBindingError) .. " Falling back to RightShift.")
+		minimizeBinding = NormalizeInputBinding(Enum.KeyCode.RightShift)
+	end
+
+	local Window = {
+		Bind = minimizeBinding.EnumItem,
+		MinimizeBind = minimizeBinding,
+		MinimizeEnabled = WindowSettings.MinimizeSettings.Enabled ~= false,
+		MinimizeShowNotification = WindowSettings.MinimizeSettings.ShowNotification ~= false,
+		CurrentTab = nil,
+		State = true,
+		Size = false,
+		Settings = nil,
+	}
 
 	-- Extra topbar hide button. The existing square button keeps the compact/minimize action,
 	-- while this minus button hides the whole interface and allows reopening with the UI bind.
@@ -3949,23 +4023,29 @@ function Luna:CreateWindow(WindowSettings)
 				end
 				resizeBindBox()
 
-				local function currentKeyCode()
-					return Enum.KeyCode[tostring(BindSettings.CurrentBind)]
+				local function currentBinding()
+					return NormalizeInputBinding(BindSettings.CurrentBind)
 				end
 
 				local function setBind(newBind, fireChanged)
-					newBind = tostring(newBind or BindSettings.CurrentBind or "Q")
-					if not Enum.KeyCode[newBind] then return false end
-					local changed = tostring(BindSettings.CurrentBind) ~= newBind
-					BindSettings.CurrentBind = newBind
-					BindV.CurrentBind = newBind
-					Bind.BindFrame.BindBox.Text = newBind
+					local binding = NormalizeInputBinding(
+						newBind,
+						BindSettings.CurrentBind or "Q"
+					)
+					if not binding then return false end
+					local bindName = binding.Name
+					local changed = tostring(BindSettings.CurrentBind) ~= bindName
+					BindSettings.CurrentBind = bindName
+					BindV.CurrentBind = bindName
+					Bind.BindFrame.BindBox.Text = bindName
 					resizeBindBox()
 					if changed and fireChanged and IsComponentUsable(BindV) then
-						SafeCall(BindSettings.OnChangedCallback, newBind)
+						SafeCall(BindSettings.OnChangedCallback, bindName)
 					end
 					return true
 				end
+
+				setBind(BindSettings.CurrentBind, false)
 
 				ConnectComponent(BindV, Bind.BindFrame.BindBox.Focused, function()
 					if BindV.Disabled then return end
@@ -3987,16 +4067,16 @@ function Luna:CreateWindow(WindowSettings)
 				ConnectComponent(BindV, UserInputService.InputBegan, function(input, processed)
 					if Luna._Destroyed or BindV._Destroyed then return end
 					if checkingForKey then
-						if input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode ~= Window.Bind then
-							local newBind = tostring(input.KeyCode):match("Enum%.KeyCode%.(.+)")
-							if newBind then setBind(newBind, true) end
+						local newBinding = InputToBinding(input)
+						if newBinding then
+							setBind(newBinding.Name, true)
 							Bind.BindFrame.BindBox:ReleaseFocus()
 						end
 						return
 					end
 					if processed or BindV.Disabled then return end
-					local keyCode = currentKeyCode()
-					if not keyCode or input.KeyCode ~= keyCode then return end
+					local binding = currentBinding()
+					if not binding or not InputMatchesBinding(input, binding) then return end
 
 					if BindSettings.HoldToInteract then
 						if not BindV.Active then
@@ -4011,8 +4091,8 @@ function Luna:CreateWindow(WindowSettings)
 
 				ConnectComponent(BindV, UserInputService.InputEnded, function(input)
 					if BindV._Destroyed or not BindSettings.HoldToInteract or not BindV.Active then return end
-					local keyCode = currentKeyCode()
-					if keyCode and input.KeyCode == keyCode then
+					local binding = currentBinding()
+					if binding and InputMatchesBinding(input, binding) then
 						BindV.Active = false
 						SafeCall(BindSettings.Callback, false)
 					end
@@ -5433,23 +5513,29 @@ function Luna:CreateWindow(WindowSettings)
 			end
 			resizeBindBox()
 
-			local function currentKeyCode()
-				return Enum.KeyCode[tostring(BindSettings.CurrentBind)]
+			local function currentBinding()
+				return NormalizeInputBinding(BindSettings.CurrentBind)
 			end
 
 			local function setBind(newBind, fireChanged)
-				newBind = tostring(newBind or BindSettings.CurrentBind or "Q")
-				if not Enum.KeyCode[newBind] then return false end
-				local changed = tostring(BindSettings.CurrentBind) ~= newBind
-				BindSettings.CurrentBind = newBind
-				BindV.CurrentBind = newBind
-				Bind.BindFrame.BindBox.Text = newBind
+				local binding = NormalizeInputBinding(
+					newBind,
+					BindSettings.CurrentBind or "Q"
+				)
+				if not binding then return false end
+				local bindName = binding.Name
+				local changed = tostring(BindSettings.CurrentBind) ~= bindName
+				BindSettings.CurrentBind = bindName
+				BindV.CurrentBind = bindName
+				Bind.BindFrame.BindBox.Text = bindName
 				resizeBindBox()
 				if changed and fireChanged and IsComponentUsable(BindV) then
-					SafeCall(BindSettings.OnChangedCallback, newBind)
+					SafeCall(BindSettings.OnChangedCallback, bindName)
 				end
 				return true
 			end
+
+			setBind(BindSettings.CurrentBind, false)
 
 			ConnectComponent(BindV, Bind.BindFrame.BindBox.Focused, function()
 				if BindV.Disabled then return end
@@ -5471,16 +5557,16 @@ function Luna:CreateWindow(WindowSettings)
 			ConnectComponent(BindV, UserInputService.InputBegan, function(input, processed)
 				if Luna._Destroyed or BindV._Destroyed then return end
 				if checkingForKey then
-					if input.KeyCode ~= Enum.KeyCode.Unknown and input.KeyCode ~= Window.Bind then
-						local newBind = tostring(input.KeyCode):match("Enum%.KeyCode%.(.+)")
-						if newBind then setBind(newBind, true) end
+					local newBinding = InputToBinding(input)
+					if newBinding then
+						setBind(newBinding.Name, true)
 						Bind.BindFrame.BindBox:ReleaseFocus()
 					end
 					return
 				end
 				if processed or BindV.Disabled then return end
-				local keyCode = currentKeyCode()
-				if not keyCode or input.KeyCode ~= keyCode then return end
+				local binding = currentBinding()
+				if not binding or not InputMatchesBinding(input, binding) then return end
 
 				if BindSettings.HoldToInteract then
 					if not BindV.Active then
@@ -5495,8 +5581,8 @@ function Luna:CreateWindow(WindowSettings)
 
 			ConnectComponent(BindV, UserInputService.InputEnded, function(input)
 				if BindV._Destroyed or not BindSettings.HoldToInteract or not BindV.Active then return end
-				local keyCode = currentKeyCode()
-				if keyCode and input.KeyCode == keyCode then
+				local binding = currentBinding()
+				if binding and InputMatchesBinding(input, binding) then
 					BindV.Active = false
 					SafeCall(BindSettings.Callback, false)
 				end
@@ -6339,7 +6425,7 @@ function Luna:CreateWindow(WindowSettings)
 
 			Tab:CreateButton({
 				Name = "Create Config",
-				Description = "Save all current settings into a new config.",
+				Description = "Save all current settings into a validated .json config.",
 				Callback = function()
 					local success, result = Luna:SaveConfig(inputPath)
 					if not success then notify("Unable to save config: " .. tostring(result), "error"); return end
@@ -6351,7 +6437,7 @@ function Luna:CreateWindow(WindowSettings)
 			Tab:CreateSection("Config Load/Settings")
 			configSelection = Tab:CreateDropdown({
 				Name = "Select Config",
-				Description = "Select a saved config.",
+				Description = "Select a saved JSON config.",
 				Options = Luna:RefreshConfigList(),
 				CurrentOption = {},
 				MultipleOptions = false,
@@ -6365,7 +6451,7 @@ function Luna:CreateWindow(WindowSettings)
 				notify(string.format("Loaded config %q", name))
 			end})
 
-			Tab:CreateButton({Name = "Overwrite Config", Description = "Overwrite the selected config.", Callback = function()
+			Tab:CreateButton({Name = "Overwrite Config", Description = "Safely overwrite the selected JSON config.", Callback = function()
 				local name = requireSelected(); if not name then return end
 				local success, result = Luna:SaveConfig(name)
 				if not success then notify("Unable to overwrite config: " .. tostring(result), "error"); return end
@@ -6386,7 +6472,7 @@ function Luna:CreateWindow(WindowSettings)
 				refreshSelection(nil)
 			end})
 
-			Tab:CreateButton({Name = "Refresh Config List", Description = "Refresh the saved config list.", Callback = function()
+			Tab:CreateButton({Name = "Refresh Config List", Description = "Refresh the saved .json config list.", Callback = function()
 				refreshSelection(nil)
 			end})
 
@@ -6412,98 +6498,236 @@ function Luna:CreateWindow(WindowSettings)
 
 		local ClassParser = {
 			["Toggle"] = {
-				Save = function(Flag, data)
+				Save = function(flag, data)
 					return {
-						type = "Toggle", 
-						flag = Flag, 
-						state = data.CurrentValue or false
+						type = "Toggle",
+						flag = flag,
+						state = data.CurrentValue == true,
 					}
 				end,
-				Load = function(Flag, data)
-					if Luna.Options[Flag] then
-						Luna.Options[Flag]:Set({ CurrentValue = data.state })
-					end
-				end
+				Validate = function(data)
+					return type(data.state) == "boolean",
+						"Toggle state must be a boolean."
+				end,
+				Load = function(flag, data)
+					Luna.Options[flag]:Set({
+						CurrentValue = data.state,
+					})
+					return true
+				end,
 			},
 			["Slider"] = {
-				Save = function(Flag, data)
+				Save = function(flag, data)
+					local value = tonumber(data.CurrentValue)
+					if value == nil then
+						return nil, "Slider value is not numeric."
+					end
 					return {
-						type = "Slider", 
-						flag = Flag, 
-						value = tonumber(data.CurrentValue),
+						type = "Slider",
+						flag = flag,
+						value = value,
 					}
 				end,
-				Load = function(Flag, data)
-					if Luna.Options[Flag] and data.value then
-						Luna.Options[Flag]:Set({ CurrentValue = tonumber(data.value) or data.value })
-					end
-				end
+				Validate = function(data)
+					return tonumber(data.value) ~= nil,
+						"Slider value must be numeric."
+				end,
+				Load = function(flag, data)
+					Luna.Options[flag]:Set({
+						CurrentValue = tonumber(data.value),
+					})
+					return true
+				end,
 			},
 			["Input"] = {
-				Save = function(Flag, data)
+				Save = function(flag, data)
 					return {
-						type = "Input", 
-						flag = Flag, 
-						text = data.CurrentValue
+						type = "Input",
+						flag = flag,
+						text = tostring(data.CurrentValue or ""),
 					}
 				end,
-				Load = function(Flag, data)
-					if Luna.Options[Flag] and data.text and type(data.text) == "string" then
-						Luna.Options[Flag]:Set({ CurrentValue = data.text })
-					end
-				end
+				Validate = function(data)
+					return type(data.text) == "string",
+						"Input text must be a string."
+				end,
+				Load = function(flag, data)
+					Luna.Options[flag]:Set({
+						CurrentValue = data.text,
+					})
+					return true
+				end,
 			},
 			["Dropdown"] = {
-				Save = function(Flag, data)
+				Save = function(flag, data)
+					local value = data.CurrentOption
+					if type(value) ~= "table" and type(value) ~= "string" then
+						return nil, "Dropdown value must be a string or table."
+					end
 					return {
-						type = "Dropdown", 
-						flag = Flag, 
-						value = data.CurrentOption
+						type = "Dropdown",
+						flag = flag,
+						value = value,
 					}
 				end,
-				Load = function(Flag, data)
-					if Luna.Options[Flag] and data.value then
-						Luna.Options[Flag]:Set({ CurrentOption = data.value })
-					end
-				end
-			},
-
-			["Bind"] = {
-				Save = function(Flag, data)
-					return {type = "Bind", flag = Flag, bind = data.CurrentBind or (data.Settings and data.Settings.CurrentBind)}
+				Validate = function(data)
+					local valueType = type(data.value)
+					return valueType == "table" or valueType == "string",
+						"Dropdown value must be a string or table."
 				end,
-				Load = function(Flag, data)
-					if Luna.Options[Flag] and data.bind then Luna.Options[Flag]:Set({CurrentBind = tostring(data.bind)}) end
-				end
+				Load = function(flag, data)
+					Luna.Options[flag]:Set({
+						CurrentOption = data.value,
+					})
+					return true
+				end,
+			},
+			["Bind"] = {
+				Save = function(flag, data)
+					local bindName = InputBindingName(
+						data.CurrentBind
+							or (data.Settings and data.Settings.CurrentBind)
+					)
+					if not bindName then
+						return nil, "Keybind is invalid."
+					end
+					return {
+						type = "Bind",
+						flag = flag,
+						bind = bindName,
+					}
+				end,
+				Validate = function(data)
+					return InputBindingName(data.bind) ~= nil,
+						"Keybind is invalid."
+				end,
+				Load = function(flag, data)
+					Luna.Options[flag]:Set({
+						CurrentBind = InputBindingName(data.bind),
+					})
+					return true
+				end,
 			},
 			["Colorpicker"] = {
-				Save = function(Flag, data)
-					local function Color3ToHex(color)
-						if typeof(color) ~= "Color3" then return nil end
-						return string.format("#%02X%02X%02X", math.floor(color.R * 255), math.floor(color.G * 255), math.floor(color.B * 255))
+				Save = function(flag, data)
+					if typeof(data.Color) ~= "Color3" then
+						return nil, "Colorpicker value is invalid."
 					end
-
+					local hex = string.format(
+						"#%02X%02X%02X",
+						math.floor(data.Color.R * 255 + 0.5),
+						math.floor(data.Color.G * 255 + 0.5),
+						math.floor(data.Color.B * 255 + 0.5)
+					)
 					return {
-						type = "Colorpicker", 
-						flag = Flag, 
-						color = Color3ToHex(data.Color),
-						alpha = data.Alpha
+						type = "Colorpicker",
+						flag = flag,
+						color = hex,
+						alpha = math.clamp(tonumber(data.Alpha) or 0, 0, 1),
 					}
 				end,
-				Load = function(Flag, data)
-					local function HexToColor3(hex)
-						local r = tonumber(hex:sub(2, 3), 16) / 255
-						local g = tonumber(hex:sub(4, 5), 16) / 255
-						local b = tonumber(hex:sub(6, 7), 16) / 255
-						return Color3.new(r, g, b)
+				Validate = function(data)
+					if type(data.color) ~= "string"
+						or not data.color:match("^#%x%x%x%x%x%x$")
+					then
+						return false, "Colorpicker hex value is invalid."
 					end
+					local alpha = tonumber(data.alpha)
+					if alpha == nil or alpha < 0 or alpha > 1 then
+						return false, "Colorpicker alpha must be between 0 and 1."
+					end
+					return true
+				end,
+				Load = function(flag, data)
+					local color = Color3.fromRGB(
+						tonumber(data.color:sub(2, 3), 16),
+						tonumber(data.color:sub(4, 5), 16),
+						tonumber(data.color:sub(6, 7), 16)
+					)
+					Luna.Options[flag]:Set({
+						Color = color,
+						Alpha = tonumber(data.alpha) or 0,
+					})
+					return true
+				end,
+			},
+		}
 
-					if Luna.Options[Flag] and data.color then
-						Luna.Options[Flag]:Set({Color = HexToColor3(data.color), Alpha = tonumber(data.alpha) or 0})
+		local CONFIG_FORMAT = "LunaJSON"
+		local AUTOLOAD_FORMAT = "LunaAutoloadJSON"
+
+		local function ValidateConfigDocument(decoded, requireCurrentOptions)
+			if type(decoded) ~= "table" then
+				return false, "Config root must be a JSON object."
+			end
+
+			local version = tonumber(decoded.version)
+			if not version or version < 1 or version % 1 ~= 0 then
+				return false, "Config version is invalid."
+			end
+
+			if version > Luna.ConfigVersion then
+				return false, "Config was created by a newer Luna version."
+			end
+
+			if decoded.format ~= nil and decoded.format ~= CONFIG_FORMAT then
+				return false, "Unsupported config format."
+			end
+
+			if type(decoded.objects) ~= "table" then
+				return false, "Config objects must be an array."
+			end
+
+			local seenFlags = {}
+
+			for index, object in ipairs(decoded.objects) do
+				if type(object) ~= "table" then
+					return false, ("Config object #%d is invalid."):format(index)
+				end
+
+				local flag = object.flag
+				local objectType = object.type
+
+				if type(flag) ~= "string" or flag == "" then
+					return false, ("Config object #%d has an invalid flag."):format(index)
+				end
+
+				if seenFlags[flag] then
+					return false, ("Duplicate flag %q exists in the JSON config."):format(flag)
+				end
+				seenFlags[flag] = true
+
+				local parser = ClassParser[objectType]
+				if not parser then
+					return false, ("Unsupported config object type %q."):format(tostring(objectType))
+				end
+
+				local valid, validationError = parser.Validate(object)
+				if not valid then
+					return false, ("Invalid %s object %q: %s"):format(
+						tostring(objectType),
+						flag,
+						tostring(validationError)
+					)
+				end
+
+				if requireCurrentOptions then
+					local current = Luna.Options[flag]
+					if not current then
+						return false, ("Config flag %q does not exist in the current interface."):format(flag)
+					end
+					if current.Class ~= objectType then
+						return false, ("Config flag %q expects %s but found %s."):format(
+							flag,
+							tostring(current.Class),
+							tostring(objectType)
+						)
 					end
 				end
-			}
-		}
+			end
+
+			return true
+		end
 
 
 		function Tab:BuildThemeSection()
@@ -6582,82 +6806,253 @@ function Luna:CreateWindow(WindowSettings)
 		end
 
 		local function SetFolder()
-			if WindowSettings.ConfigSettings.RootFolder ~= nil and WindowSettings.ConfigSettings.RootFolder ~= "" then
-				Luna.Folder = tostring(WindowSettings.ConfigSettings.RootFolder) .. "/" .. tostring(WindowSettings.ConfigSettings.ConfigFolder)
+			if WindowSettings.ConfigSettings.RootFolder ~= nil
+				and WindowSettings.ConfigSettings.RootFolder ~= ""
+			then
+				Luna.Folder =
+					tostring(WindowSettings.ConfigSettings.RootFolder)
+					.. "/"
+					.. tostring(WindowSettings.ConfigSettings.ConfigFolder)
 			else
-				Luna.Folder = tostring(WindowSettings.ConfigSettings.ConfigFolder)
+				Luna.Folder =
+					tostring(WindowSettings.ConfigSettings.ConfigFolder)
 			end
 			return BuildFolderTree()
 		end
 		SetFolder()
 
+		local function ConfigName(path)
+			local name = tostring(path or "")
+			name = name:gsub("%.[Jj][Ss][Oo][Nn]$", "")
+			return SanitizeFileName(name)
+		end
+
 		local function ConfigPath(path)
-			local safe = SanitizeFileName(path)
-			if not safe then return nil, "Please provide a valid config name." end
-			return Luna.Folder .. "/settings/" .. safe .. ".luna", safe
+			local safe = ConfigName(path)
+			if not safe then
+				return nil, "Please provide a valid config name."
+			end
+			return Luna.Folder
+				.. "/settings/"
+				.. safe
+				.. Luna.ConfigExtension,
+				safe
+		end
+
+		local function AutoloadPath()
+			return Luna.Folder .. "/settings/autoload.json"
+		end
+
+		local function WriteVerifiedFile(path, content)
+			if type(writefile) ~= "function" then
+				return false, "Executor does not support writefile."
+			end
+
+			local temporary =
+				path
+				.. ".tmp-"
+				.. HttpService:GenerateGUID(false)
+
+			local tempSuccess, tempError =
+				pcall(writefile, temporary, content)
+			if not tempSuccess then
+				return false, tostring(tempError)
+			end
+
+			if type(readfile) == "function" then
+				local verifySuccess, verifyContent =
+					pcall(readfile, temporary)
+				if not verifySuccess or verifyContent ~= content then
+					if type(delfile) == "function" then
+						pcall(delfile, temporary)
+					end
+					return false, "Temporary config verification failed."
+				end
+			end
+
+			local writeSuccess, writeError =
+				pcall(writefile, path, content)
+			if not writeSuccess then
+				if type(delfile) == "function" then
+					pcall(delfile, temporary)
+				end
+				return false, tostring(writeError)
+			end
+
+			if type(readfile) == "function" then
+				local verifySuccess, verifyContent =
+					pcall(readfile, path)
+				if not verifySuccess or verifyContent ~= content then
+					if type(delfile) == "function" then
+						pcall(delfile, temporary)
+					end
+					return false, "Final config verification failed."
+				end
+			end
+
+			if type(delfile) == "function" then
+				pcall(delfile, temporary)
+			end
+
+			return true
+		end
+
+		local function EncodeJson(value)
+			local success, encoded =
+				pcall(HttpService.JSONEncode, HttpService, value)
+			if not success then
+				return false, "Unable to encode JSON: " .. tostring(encoded)
+			end
+			return true, encoded
+		end
+
+		local function DecodeJson(raw)
+			local success, decoded =
+				pcall(HttpService.JSONDecode, HttpService, tostring(raw or ""))
+			if not success then
+				return false, "Unable to decode JSON: " .. tostring(decoded)
+			end
+			return true, decoded
 		end
 
 		function Luna:SaveConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-			if type(writefile) ~= "function" then return false, "Executor does not support writefile." end
+
 			local folderSuccess, folderError = BuildFolderTree()
 			if not folderSuccess then return false, folderError end
 
-			local data = {version = Luna.ConfigVersion, createdAt = os.time(), objects = {}}
-			for flag, option in next, Luna.Options do
-				if ClassParser[option.Class] and not option.IgnoreConfig then
-					local success, object = pcall(ClassParser[option.Class].Save, flag, option)
-					if success and object then table.insert(data.objects, object) end
+			local createdAt = os.time()
+
+			if type(isfile) == "function"
+				and type(readfile) == "function"
+				and isfile(fullPath)
+			then
+				local oldReadSuccess, oldRaw = pcall(readfile, fullPath)
+				if oldReadSuccess then
+					local oldDecodeSuccess, oldDecoded = DecodeJson(oldRaw)
+					if oldDecodeSuccess and type(oldDecoded) == "table" then
+						createdAt = tonumber(oldDecoded.createdAt) or createdAt
+					end
 				end
 			end
 
-			local encodedSuccess, encoded = pcall(HttpService.JSONEncode, HttpService, data)
-			if not encodedSuccess then return false, "Unable to encode config JSON." end
-			local writeSuccess, writeError = pcall(writefile, fullPath, encoded)
-			if not writeSuccess then return false, tostring(writeError) end
+			local data = {
+				format = CONFIG_FORMAT,
+				version = Luna.ConfigVersion,
+				libraryVersion = Luna.Version,
+				createdAt = createdAt,
+				updatedAt = os.time(),
+				placeId = game.PlaceId,
+				objects = {},
+			}
+
+			local flags = {}
+			for flag, option in pairs(Luna.Options) do
+				if ClassParser[option.Class] and not option.IgnoreConfig then
+					table.insert(flags, flag)
+				end
+			end
+			table.sort(flags)
+
+			for _, flag in ipairs(flags) do
+				local option = Luna.Options[flag]
+				local parser = ClassParser[option.Class]
+				local success, object, saveError =
+					pcall(parser.Save, flag, option)
+
+				if not success then
+					return false, ("Unable to save flag %q: %s"):format(
+						flag,
+						tostring(object)
+					)
+				end
+
+				if type(object) ~= "table" then
+					return false, ("Unable to save flag %q: %s"):format(
+						flag,
+						tostring(saveError or "parser returned no object")
+					)
+				end
+
+				table.insert(data.objects, object)
+			end
+
+			local valid, validationError =
+				ValidateConfigDocument(data, true)
+			if not valid then
+				return false, validationError
+			end
+
+			local encodedSuccess, encoded = EncodeJson(data)
+			if not encodedSuccess then return false, encoded end
+
+			local writeSuccess, writeError =
+				WriteVerifiedFile(fullPath, encoded)
+			if not writeSuccess then return false, writeError end
+
 			return true, safeName
 		end
 
 		function Luna:LoadConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-			if type(isfile) ~= "function" or type(readfile) ~= "function" then return false, "Executor does not support config reading." end
-			if not isfile(fullPath) then return false, "Invalid config file." end
+
+			if type(isfile) ~= "function"
+				or type(readfile) ~= "function"
+			then
+				return false, "Executor does not support config reading."
+			end
+
+			if not isfile(fullPath) then
+				return false, "Config does not exist."
+			end
+
 			local readSuccess, raw = pcall(readfile, fullPath)
 			if not readSuccess then return false, tostring(raw) end
-			local decodeSuccess, decoded = pcall(HttpService.JSONDecode, HttpService, raw)
-			if not decodeSuccess or type(decoded) ~= "table" or type(decoded.objects) ~= "table" then
-				return false, "Unable to decode or validate config JSON."
-			end
-			local configVersion = tonumber(decoded.version) or 1
-			if configVersion > Luna.ConfigVersion then
-				return false, "Config was created by a newer Luna version."
-			end
-			decoded.version = Luna.ConfigVersion
 
-			local errors = {}
-			for _, option in ipairs(decoded.objects) do
-				local parser = type(option) == "table" and ClassParser[option.type]
-				if parser then
-					local success, err = pcall(parser.Load, option.flag, option)
-					if not success then table.insert(errors, tostring(err)) end
+			local decodeSuccess, decoded = DecodeJson(raw)
+			if not decodeSuccess then return false, decoded end
+
+			local valid, validationError =
+				ValidateConfigDocument(decoded, true)
+			if not valid then return false, validationError end
+
+			for _, object in ipairs(decoded.objects) do
+				local parser = ClassParser[object.type]
+				local success, result =
+					pcall(parser.Load, object.flag, object)
+				if not success or result ~= true then
+					return false, ("Unable to load flag %q: %s"):format(
+						object.flag,
+						tostring(result)
+					)
 				end
 			end
-			if #errors > 0 then return false, table.concat(errors, "; ") end
+
 			return true, safeName
 		end
 
 		function Luna:RefreshConfigList()
 			if type(listfiles) ~= "function" then return {} end
-			BuildFolderTree()
-			local success, files = pcall(listfiles, Luna.Folder .. "/settings")
+
+			local folderSuccess = BuildFolderTree()
+			if not folderSuccess then return {} end
+
+			local success, files =
+				pcall(listfiles, Luna.Folder .. "/settings")
 			if not success or type(files) ~= "table" then return {} end
+
 			local output = {}
 			for _, filePath in ipairs(files) do
-				local name = tostring(filePath):match("([^/\\]+)%.luna$")
-				if name and name ~= "options" then table.insert(output, name) end
+				local name = tostring(filePath):match(
+					"([^/\\]+)%.json$"
+				)
+				if name and name ~= "autoload" then
+					table.insert(output, name)
+				end
 			end
+
 			table.sort(output)
 			return output
 		end
@@ -6665,11 +7060,24 @@ function Luna:CreateWindow(WindowSettings)
 		function Luna:DeleteConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-			if type(isfile) ~= "function" or type(delfile) ~= "function" then return false, "Executor does not support deleting files." end
-			if not isfile(fullPath) then return false, "Config does not exist." end
-			local success, err = pcall(delfile, fullPath)
-			if not success then return false, tostring(err) end
-			if self:GetAutoload() == safeName then self:DeleteAutoload() end
+
+			if type(isfile) ~= "function"
+				or type(delfile) ~= "function"
+			then
+				return false, "Executor does not support deleting files."
+			end
+
+			if not isfile(fullPath) then
+				return false, "Config does not exist."
+			end
+
+			local success, deleteError = pcall(delfile, fullPath)
+			if not success then return false, tostring(deleteError) end
+
+			if self:GetAutoload() == safeName then
+				self:DeleteAutoload()
+			end
+
 			return true, safeName
 		end
 
@@ -6678,75 +7086,208 @@ function Luna:CreateWindow(WindowSettings)
 			local newPath, safeNew = ConfigPath(newName)
 			if not oldPath then return false, safeOld end
 			if not newPath then return false, safeNew end
-			if type(readfile) ~= "function" or type(writefile) ~= "function" or type(delfile) ~= "function" or type(isfile) ~= "function" then
+
+			if type(readfile) ~= "function"
+				or type(writefile) ~= "function"
+				or type(delfile) ~= "function"
+				or type(isfile) ~= "function"
+			then
 				return false, "Executor does not support renaming files."
 			end
-			if not isfile(oldPath) then return false, "Original config does not exist." end
-			if isfile(newPath) then return false, "A config with the new name already exists." end
-			local readSuccess, raw = pcall(readfile, oldPath); if not readSuccess then return false, tostring(raw) end
-			local writeSuccess, writeError = pcall(writefile, newPath, raw); if not writeSuccess then return false, tostring(writeError) end
-			local deleteSuccess, deleteError = pcall(delfile, oldPath); if not deleteSuccess then return false, tostring(deleteError) end
-			if self:GetAutoload() == safeOld then self:SetAutoload(safeNew) end
+
+			if not isfile(oldPath) then
+				return false, "Original config does not exist."
+			end
+			if isfile(newPath) then
+				return false, "A config with the new name already exists."
+			end
+
+			local readSuccess, raw = pcall(readfile, oldPath)
+			if not readSuccess then return false, tostring(raw) end
+
+			local decodeSuccess, decoded = DecodeJson(raw)
+			if not decodeSuccess then return false, decoded end
+			local valid, validationError =
+				ValidateConfigDocument(decoded, false)
+			if not valid then return false, validationError end
+
+			local writeSuccess, writeError =
+				WriteVerifiedFile(newPath, raw)
+			if not writeSuccess then return false, writeError end
+
+			local deleteSuccess, deleteError =
+				pcall(delfile, oldPath)
+			if not deleteSuccess then
+				pcall(delfile, newPath)
+				return false,
+					"Rename rollback: unable to delete original config: "
+					.. tostring(deleteError)
+			end
+
+			if self:GetAutoload() == safeOld then
+				local autoloadSuccess, autoloadError =
+					self:SetAutoload(safeNew)
+				if not autoloadSuccess then
+					return false,
+						"Config renamed, but autoload update failed: "
+						.. tostring(autoloadError)
+				end
+			end
+
 			return true, safeNew
 		end
 
 		function Luna:SetAutoload(path)
 			local fullPath, safeName = ConfigPath(path)
-			if not fullPath then return false, safeName end
-			if not table.find(self:RefreshConfigList(), safeName) then return false, "Config does not exist." end
-			if type(writefile) ~= "function" then return false, "Executor does not support writefile." end
-			BuildFolderTree()
-			local success, err = pcall(writefile, Luna.Folder .. "/settings/autoload.txt", safeName)
-			return success, success and safeName or tostring(err)
+			if not fullPath then
+				return false, safeName
+			end
+
+			if not table.find(self:RefreshConfigList(), safeName) then
+				return false, "Config does not exist."
+			end
+
+			local data = {
+				format = AUTOLOAD_FORMAT,
+				version = 1,
+				config = safeName,
+			}
+
+			local encodeSuccess, encoded = EncodeJson(data)
+			if not encodeSuccess then return false, encoded end
+
+			local writeSuccess, writeError =
+				WriteVerifiedFile(AutoloadPath(), encoded)
+			return writeSuccess,
+				writeSuccess and safeName or writeError
 		end
 
 		function Luna:GetAutoload()
-			local path = Luna.Folder .. "/settings/autoload.txt"
-			if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(path) then return nil end
-			local success, name = pcall(readfile, path)
-			return success and SanitizeFileName(name) or nil
+			local path = AutoloadPath()
+			if type(isfile) ~= "function"
+				or type(readfile) ~= "function"
+				or not isfile(path)
+			then
+				return nil
+			end
+
+			local readSuccess, raw = pcall(readfile, path)
+			if not readSuccess then return nil end
+
+			local decodeSuccess, decoded = DecodeJson(raw)
+			if not decodeSuccess
+				or type(decoded) ~= "table"
+				or decoded.format ~= AUTOLOAD_FORMAT
+				or tonumber(decoded.version) ~= 1
+			then
+				return nil
+			end
+
+			local safeName = ConfigName(decoded.config)
+			if not safeName then return nil end
+
+			local configPath = ConfigPath(safeName)
+			if type(isfile) == "function" and not isfile(configPath) then
+				return nil
+			end
+
+			return safeName
 		end
 
 		function Luna:DeleteAutoload()
-			local path = Luna.Folder .. "/settings/autoload.txt"
-			if type(isfile) ~= "function" or type(delfile) ~= "function" then return false, "Executor does not support deleting files." end
-			if not isfile(path) then return true, "Autoload is already disabled." end
-			local success, err = pcall(delfile, path)
-			return success, success and "Autoload deleted." or tostring(err)
+			local path = AutoloadPath()
+			if type(isfile) ~= "function"
+				or type(delfile) ~= "function"
+			then
+				return false, "Executor does not support deleting files."
+			end
+
+			if not isfile(path) then
+				return true, "Autoload is already disabled."
+			end
+
+			local success, deleteError = pcall(delfile, path)
+			return success,
+				success and "Autoload deleted." or tostring(deleteError)
 		end
 
 		function Luna:LoadAutoloadConfig()
 			local name = self:GetAutoload()
-			if not name then return false, "No autoload config is set." end
-			local success, err = self:LoadConfig(name)
-			if not success then
-				self:Notification({Title = "Interface", Icon = "warning", ImageSource = "Material", Content = "Failed to load autoload config: " .. tostring(err)})
-				return false, err
+			if not name then
+				return false, "No valid autoload JSON is set."
 			end
-			self:Notification({Title = "Interface", Icon = "sparkle", ImageSource = "Material", Content = string.format("Auto loaded config %q", name)})
+
+			local success, result = self:LoadConfig(name)
+			if not success then
+				self:Notification({
+					Title = "Interface",
+					Icon = "warning",
+					ImageSource = "Material",
+					Content =
+						"Failed to load autoload config: "
+						.. tostring(result),
+				})
+				return false, result
+			end
+
+			self:Notification({
+				Title = "Interface",
+				Icon = "sparkle",
+				ImageSource = "Material",
+				Content = string.format(
+					"Auto loaded JSON config %q",
+					name
+				),
+			})
 			return true, name
 		end
 
 		function Luna:ExportConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-			if type(isfile) ~= "function" or type(readfile) ~= "function" or not isfile(fullPath) then return false, "Config does not exist." end
+
+			if type(isfile) ~= "function"
+				or type(readfile) ~= "function"
+				or not isfile(fullPath)
+			then
+				return false, "Config does not exist."
+			end
+
 			local success, raw = pcall(readfile, fullPath)
-			return success, success and raw or tostring(raw)
+			return success,
+				success and raw or tostring(raw)
 		end
 
 		function Luna:ImportConfig(path, json)
-			local decodeSuccess, decoded = pcall(HttpService.JSONDecode, HttpService, tostring(json or ""))
-			if not decodeSuccess or type(decoded) ~= "table" or type(decoded.objects) ~= "table" then return false, "Invalid config JSON." end
+			local decodeSuccess, decoded = DecodeJson(json)
+			if not decodeSuccess then return false, decoded end
+
+			local valid, validationError =
+				ValidateConfigDocument(decoded, true)
+			if not valid then return false, validationError end
+
+			decoded.format = CONFIG_FORMAT
+			decoded.version = Luna.ConfigVersion
+			decoded.libraryVersion = Luna.Version
+			decoded.updatedAt = os.time()
+			decoded.createdAt =
+				tonumber(decoded.createdAt) or os.time()
+
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-			if type(writefile) ~= "function" then return false, "Executor does not support writefile." end
-			BuildFolderTree()
-			local encodeSuccess, normalized = pcall(HttpService.JSONEncode, HttpService, decoded)
-			if not encodeSuccess then return false, "Unable to normalize config JSON." end
-			local success, err = pcall(writefile, fullPath, normalized)
-			return success, success and safeName or tostring(err)
+
+			local folderSuccess, folderError = BuildFolderTree()
+			if not folderSuccess then return false, folderError end
+
+			local encodeSuccess, normalized = EncodeJson(decoded)
+			if not encodeSuccess then return false, normalized end
+
+			local writeSuccess, writeError =
+				WriteVerifiedFile(fullPath, normalized)
+			return writeSuccess,
+				writeSuccess and safeName or writeError
 		end
+
 
 		return Tab
 	end
@@ -6768,11 +7309,31 @@ function Luna:CreateWindow(WindowSettings)
 
 	local function HideWindow()
 		if Luna._Destroyed or not Window.State then return end
-		Hide(Main, Window.Bind, true)
+		Hide(
+			Main,
+			Window.MinimizeBind,
+			Window.MinimizeShowNotification
+		)
 		dragBar.Visible = false
 		Window.State = false
 		if UserInputService.KeyboardEnabled == false then
 			LunaUI.MobileSupport.Visible = true
+		end
+	end
+
+	local function ShowWindow()
+		if Luna._Destroyed or Window.State then return end
+		Unhide(Main, Window.CurrentTab)
+		LunaUI.MobileSupport.Visible = false
+		dragBar.Visible = true
+		Window.State = true
+	end
+
+	local function ToggleWindowVisibility()
+		if Window.State then
+			HideWindow()
+		else
+			ShowWindow()
 		end
 	end
 
@@ -6789,7 +7350,11 @@ function Luna:CreateWindow(WindowSettings)
 		local HideTarget = HideControl.ImageLabel
 		local MinusGlyph = HideTarget:FindFirstChild("MinusGlyph")
 
-		TrackConnection(HideTarget.MouseButton1Click:Connect(HideWindow))
+		TrackConnection(HideTarget.MouseButton1Click:Connect(function()
+			if Window.MinimizeEnabled then
+				HideWindow()
+			end
+		end))
 		TrackConnection(HideControl.MouseEnter:Connect(function()
 			if MinusGlyph then tween(MinusGlyph, {TextColor3 = Color3.new(1,1,1)}) end
 		end))
@@ -6808,13 +7373,17 @@ function Luna:CreateWindow(WindowSettings)
 	end))
 
 	TrackConnection(UserInputService.InputBegan:Connect(function(input, gpe)
-		if gpe then return end
-		if Window.State then return end
-		if input.KeyCode == Window.Bind then
-			Unhide(Main, Window.CurrentTab)
-			LunaUI.MobileSupport.Visible = false
-			dragBar.Visible = true
-			Window.State = true
+		if gpe or Luna._Destroyed or not Window.MinimizeEnabled then
+			return
+		end
+
+		-- Do not hide the UI while the user is typing or recording a bind.
+		if UserInputService:GetFocusedTextBox() then
+			return
+		end
+
+		if InputMatchesBinding(input, Window.MinimizeBind) then
+			ToggleWindowVisibility()
 		end
 	end))
 
@@ -6860,11 +7429,49 @@ function Luna:CreateWindow(WindowSettings)
 
 
 	LunaUI.MobileSupport.Interact.MouseButton1Click:Connect(function()
-		Unhide(Main, Window.CurrentTab)
-		dragBar.Visible = true
-		Window.State = true
-		LunaUI.MobileSupport.Visible = false
+		ShowWindow()
 	end)
+
+	function Window:SetMinimizeKeybind(value)
+		local binding, bindError = NormalizeInputBinding(value)
+		if not binding then
+			return false, bindError
+		end
+
+		self.MinimizeBind = binding
+		self.Bind = binding.EnumItem
+		WindowSettings.MinimizeSettings.Keybind = binding.EnumItem
+		return true, binding.Name
+	end
+
+	function Window:GetMinimizeKeybind()
+		return InputBindingName(self.MinimizeBind)
+	end
+
+	function Window:GetMinimizeKeybindEnum()
+		return self.MinimizeBind and self.MinimizeBind.EnumItem or nil
+	end
+
+	function Window:SetMinimizeEnabled(enabled)
+		local nextState = enabled ~= false
+		if not nextState and not self.State then
+			ShowWindow()
+		end
+		self.MinimizeEnabled = nextState
+		return self.MinimizeEnabled
+	end
+
+	function Window:ToggleVisibility()
+		ToggleWindowVisibility()
+	end
+
+	function Window:Minimize()
+		HideWindow()
+	end
+
+	function Window:Restore()
+		ShowWindow()
+	end
 
 	function Window:Hide() HideWindow() end
 	function Window:Close() CloseWindow() end
