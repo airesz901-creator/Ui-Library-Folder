@@ -1,4 +1,4 @@
-local Release = "Luna Final 7.0.9 - No Key System"
+local Release = "Luna Final 7.0.10 - No Key System"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -3448,58 +3448,205 @@ function Luna:CreateWindow(WindowSettings)
 			dashboard:FindFirstChild("Discord")
 
 		if discordCard then
-			local discordLogo =
+			local discordInteract =
+				findGuiButton(discordCard)
+
+			local baseZIndex = math.max(
+				tonumber(discordCard.ZIndex) or 1,
+				discordInteract
+					and (tonumber(discordInteract.ZIndex) or 1)
+					or 1
+			)
+
+			local oldLogo =
 				discordCard:FindFirstChild(
 					"AireszDiscordLogo"
 				)
 
-			if not discordLogo then
-				discordLogo = Instance.new("ImageLabel")
-				discordLogo.Name = "AireszDiscordLogo"
-				discordLogo.AnchorPoint =
-					Vector2.new(1, 0.5)
-				discordLogo.BackgroundTransparency = 1
-				discordLogo.Position =
-					UDim2.new(1, -39, 0.5, 0)
-				discordLogo.Size =
-					UDim2.fromOffset(22, 22)
-				discordLogo.Image =
-					"rbxassetid://18810599582"
-				discordLogo.ImageColor3 =
-					Color3.fromRGB(255, 255, 255)
-				discordLogo.ScaleType =
-					Enum.ScaleType.Fit
-				discordLogo.ZIndex = 10
-				discordLogo.Parent = discordCard
+			if oldLogo then
+				oldLogo:Destroy()
 			end
 
-			local discordArrow =
+			local oldHolder =
+				discordCard:FindFirstChild(
+					"AireszDiscordLogoHolder"
+				)
+
+			if oldHolder then
+				oldHolder:Destroy()
+			end
+
+			local logoHolder = Instance.new("Frame")
+			logoHolder.Name = "AireszDiscordLogoHolder"
+			logoHolder.AnchorPoint = Vector2.new(1, 0.5)
+			logoHolder.BackgroundColor3 =
+				Color3.fromRGB(88, 101, 242)
+			logoHolder.BackgroundTransparency = 0
+			logoHolder.BorderSizePixel = 0
+			logoHolder.Position =
+				UDim2.new(1, -42, 0.5, 0)
+			logoHolder.Size =
+				UDim2.fromOffset(30, 30)
+			logoHolder.ZIndex = baseZIndex + 2
+			logoHolder.ClipsDescendants = true
+			logoHolder.Parent = discordCard
+
+			local logoCorner = Instance.new("UICorner")
+			logoCorner.CornerRadius = UDim.new(0, 8)
+			logoCorner.Parent = logoHolder
+
+			-- Pure-UI fallback. This remains visible until the
+			-- external Discord decal thumbnail has loaded.
+			local fallbackLogo = Instance.new("Frame")
+			fallbackLogo.Name = "DiscordVectorFallback"
+			fallbackLogo.BackgroundTransparency = 1
+			fallbackLogo.Size = UDim2.fromScale(1, 1)
+			fallbackLogo.ZIndex = baseZIndex + 3
+			fallbackLogo.Parent = logoHolder
+
+			local leftEar = Instance.new("Frame")
+			leftEar.AnchorPoint = Vector2.new(0, 0.5)
+			leftEar.BackgroundColor3 =
+				Color3.fromRGB(255, 255, 255)
+			leftEar.BorderSizePixel = 0
+			leftEar.Position =
+				UDim2.new(0, 5, 0.5, 1)
+			leftEar.Size =
+				UDim2.fromOffset(6, 12)
+			leftEar.ZIndex = baseZIndex + 3
+			leftEar.Parent = fallbackLogo
+
+			local leftEarCorner = Instance.new("UICorner")
+			leftEarCorner.CornerRadius =
+				UDim.new(1, 0)
+			leftEarCorner.Parent = leftEar
+
+			local rightEar = Instance.new("Frame")
+			rightEar.AnchorPoint = Vector2.new(1, 0.5)
+			rightEar.BackgroundColor3 =
+				Color3.fromRGB(255, 255, 255)
+			rightEar.BorderSizePixel = 0
+			rightEar.Position =
+				UDim2.new(1, -5, 0.5, 1)
+			rightEar.Size =
+				UDim2.fromOffset(6, 12)
+			rightEar.ZIndex = baseZIndex + 3
+			rightEar.Parent = fallbackLogo
+
+			local rightEarCorner = Instance.new("UICorner")
+			rightEarCorner.CornerRadius =
+				UDim.new(1, 0)
+			rightEarCorner.Parent = rightEar
+
+			local controller = Instance.new("Frame")
+			controller.AnchorPoint = Vector2.new(0.5, 0.5)
+			controller.BackgroundColor3 =
+				Color3.fromRGB(255, 255, 255)
+			controller.BorderSizePixel = 0
+			controller.Position =
+				UDim2.new(0.5, 0, 0.5, 1)
+			controller.Size =
+				UDim2.fromOffset(19, 13)
+			controller.ZIndex = baseZIndex + 4
+			controller.Parent = fallbackLogo
+
+			local controllerCorner = Instance.new("UICorner")
+			controllerCorner.CornerRadius =
+				UDim.new(1, 0)
+			controllerCorner.Parent = controller
+
+			local eyeLeft = Instance.new("Frame")
+			eyeLeft.AnchorPoint = Vector2.new(0.5, 0.5)
+			eyeLeft.BackgroundColor3 =
+				Color3.fromRGB(88, 101, 242)
+			eyeLeft.BorderSizePixel = 0
+			eyeLeft.Position =
+				UDim2.new(0.34, 0, 0.48, 0)
+			eyeLeft.Size =
+				UDim2.fromOffset(3, 4)
+			eyeLeft.ZIndex = baseZIndex + 5
+			eyeLeft.Parent = controller
+
+			local eyeLeftCorner = Instance.new("UICorner")
+			eyeLeftCorner.CornerRadius =
+				UDim.new(1, 0)
+			eyeLeftCorner.Parent = eyeLeft
+
+			local eyeRight = eyeLeft:Clone()
+			eyeRight.Position =
+				UDim2.new(0.66, 0, 0.48, 0)
+			eyeRight.Parent = controller
+
+			local discordLogo = Instance.new("ImageLabel")
+			discordLogo.Name = "AireszDiscordLogo"
+			discordLogo.AnchorPoint =
+				Vector2.new(0.5, 0.5)
+			discordLogo.BackgroundTransparency = 1
+			discordLogo.Position =
+				UDim2.fromScale(0.5, 0.5)
+			discordLogo.Size =
+				UDim2.fromScale(0.88, 0.88)
+			discordLogo.Image =
+				"rbxthumb://type=Asset&id=18810599582&w=420&h=420"
+			discordLogo.ImageColor3 =
+				Color3.fromRGB(255, 255, 255)
+			discordLogo.ImageTransparency = 0
+			discordLogo.ScaleType =
+				Enum.ScaleType.Fit
+			discordLogo.ZIndex = baseZIndex + 6
+			discordLogo.Parent = logoHolder
+
+			task.spawn(function()
+				local started = os.clock()
+
+				while discordLogo.Parent
+					and not discordLogo.IsLoaded
+					and (os.clock() - started) < 3
+				do
+					task.wait(0.05)
+				end
+
+				if not discordLogo.Parent then
+					return
+				end
+
+				if discordLogo.IsLoaded then
+					fallbackLogo.Visible = false
+				else
+					discordLogo.Visible = false
+					fallbackLogo.Visible = true
+				end
+			end)
+
+			local oldArrow =
 				discordCard:FindFirstChild(
 					"AireszDiscordArrow"
 				)
 
-			if not discordArrow then
-				discordArrow = Instance.new("TextLabel")
-				discordArrow.Name = "AireszDiscordArrow"
-				discordArrow.AnchorPoint =
-					Vector2.new(1, 0.5)
-				discordArrow.BackgroundTransparency = 1
-				discordArrow.Position =
-					UDim2.new(1, -11, 0.5, -1)
-				discordArrow.Size =
-					UDim2.fromOffset(20, 24)
-				discordArrow.Font =
-					Enum.Font.GothamBold
-				discordArrow.Text = "›"
-				discordArrow.TextColor3 =
-					Color3.fromRGB(210, 214, 230)
-				discordArrow.TextSize = 22
-				discordArrow.ZIndex = 10
-				discordArrow.Parent = discordCard
+			if oldArrow then
+				oldArrow:Destroy()
 			end
 
-			local discordInteract =
-				findGuiButton(discordCard)
+			local discordArrow =
+				Instance.new("TextLabel")
+			discordArrow.Name =
+				"AireszDiscordArrow"
+			discordArrow.AnchorPoint =
+				Vector2.new(1, 0.5)
+			discordArrow.BackgroundTransparency = 1
+			discordArrow.Position =
+				UDim2.new(1, -10, 0.5, -1)
+			discordArrow.Size =
+				UDim2.fromOffset(20, 26)
+			discordArrow.Font =
+				Enum.Font.GothamBold
+			discordArrow.Text = "›"
+			discordArrow.TextColor3 =
+				Color3.fromRGB(220, 224, 240)
+			discordArrow.TextSize = 24
+			discordArrow.TextTransparency = 0
+			discordArrow.ZIndex = baseZIndex + 6
+			discordArrow.Parent = discordCard
 
 			if discordInteract then
 				TrackConnection(
