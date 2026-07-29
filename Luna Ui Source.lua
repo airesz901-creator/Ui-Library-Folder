@@ -1,4 +1,4 @@
-local Release = "Luna Final 7.0.8 - No Key System"
+local Release = "Luna Final 7.0.9 - No Key System"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -3247,20 +3247,348 @@ function Luna:CreateWindow(WindowSettings)
 			and "Your Executor Supports This Script."
 			or "Your Executor Isn't Officially Supported By This Script."
 
-		TrackConnection(HomeTabPage.detailsholder.dashboard.Discord.Interact.MouseButton1Click:Connect(function()
-			local invite = tostring(HomeTabSettings.DiscordInvite or "")
+		local function homeNotification(title, content, icon)
+			Luna:Notification({
+				Title = tostring(title),
+				Content = tostring(content),
+				Icon = icon or "content_copy",
+				ImageSource = "Material",
+				Duration = 4,
+			})
+		end
+
+		local function copyHomeText(text, successTitle, successContent)
+			text = tostring(text or "")
+			if text == "" then
+				homeNotification(
+					"Nothing to copy",
+					"The requested content is empty.",
+					"error_outline"
+				)
+				return false
+			end
+
+			local clipboardFunctions = {}
+
 			if type(setclipboard) == "function" then
-				pcall(setclipboard, "https://discord.gg/" .. invite)
+				table.insert(clipboardFunctions, setclipboard)
 			end
-			if type(request) == "function" and invite ~= "" and invite ~= "noinvitelink" then
-				pcall(request, {
-					Url = "http://127.0.0.1:6463/rpc?v=1",
-					Method = "POST",
-					Headers = { ["Content-Type"] = "application/json", Origin = "https://discord.com" },
-					Body = HttpService:JSONEncode({cmd = "INVITE_BROWSER", nonce = HttpService:GenerateGUID(false), args = {code = invite}})
-				})
+
+			if type(toclipboard) == "function" then
+				table.insert(clipboardFunctions, toclipboard)
 			end
-		end), homeConnections)
+
+			for _, clipboardFunction in ipairs(clipboardFunctions) do
+				local success = pcall(clipboardFunction, text)
+
+				if success then
+					homeNotification(
+						successTitle or "Copied",
+						successContent or "Copied to clipboard.",
+						"content_copy"
+					)
+					return true
+				end
+			end
+
+			homeNotification(
+				"Clipboard unavailable",
+				"Your executor does not support clipboard copying.",
+				"error_outline"
+			)
+			return false
+		end
+
+		local function normalizeDiscordInvite(value)
+			local invite = tostring(value or "")
+				:match("^%s*(.-)%s*$")
+
+			if invite == ""
+				or invite:lower() == "noinvitelink"
+			then
+				return nil, nil
+			end
+
+			local code =
+				invite:match("discord%.gg/([^/%?]+)")
+				or invite:match(
+					"discord%.com/invite/([^/%?]+)"
+				)
+				or invite:match(
+					"discordapp%.com/invite/([^/%?]+)"
+				)
+				or invite
+
+			code = tostring(code or "")
+				:match("^%s*(.-)%s*$")
+
+			if code == "" then
+				return nil, nil
+			end
+
+			return "https://discord.gg/" .. code, code
+		end
+
+		local function findGuiButton(object)
+			if not object then
+				return nil
+			end
+
+			if object:IsA("GuiButton") then
+				return object
+			end
+
+			local directInteract =
+				object:FindFirstChild("Interact")
+
+			if directInteract
+				and directInteract:IsA("GuiButton")
+			then
+				return directInteract
+			end
+
+			for _, descendant in ipairs(
+				object:GetDescendants()
+			) do
+				if descendant:IsA("GuiButton") then
+					return descendant
+				end
+			end
+
+			return nil
+		end
+
+		local function findJoinScriptButton(root)
+			if not root then
+				return nil
+			end
+
+			local exactNames = {
+				"JoinScript",
+				"CopyJoinScript",
+				"JoinServer",
+				"ServerJoin",
+			}
+
+			for _, name in ipairs(exactNames) do
+				local object =
+					root:FindFirstChild(name, true)
+				local button = findGuiButton(object)
+
+				if button then
+					return button
+				end
+			end
+
+			for _, descendant in ipairs(
+				root:GetDescendants()
+			) do
+				local text = ""
+
+				if descendant:IsA("TextLabel")
+					or descendant:IsA("TextButton")
+					or descendant:IsA("TextBox")
+				then
+					text = tostring(descendant.Text or "")
+				end
+
+				local searchable = (
+					tostring(descendant.Name)
+					.. " "
+					.. text
+				):lower()
+
+				local looksLikeJoin =
+					searchable:find(
+						"join",
+						1,
+						true
+					) ~= nil
+
+				local looksLikeScript =
+					searchable:find(
+						"script",
+						1,
+						true
+					) ~= nil
+					or searchable:find(
+						"server",
+						1,
+						true
+					) ~= nil
+
+				if looksLikeJoin and looksLikeScript then
+					local ancestor = descendant
+
+					for _ = 1, 6 do
+						if not ancestor
+							or ancestor == root
+						then
+							break
+						end
+
+						local button =
+							findGuiButton(ancestor)
+
+						if button then
+							return button
+						end
+
+						ancestor = ancestor.Parent
+					end
+				end
+			end
+
+			return nil
+		end
+
+		local dashboard =
+			HomeTabPage.detailsholder.dashboard
+		local discordCard =
+			dashboard:FindFirstChild("Discord")
+
+		if discordCard then
+			local discordLogo =
+				discordCard:FindFirstChild(
+					"AireszDiscordLogo"
+				)
+
+			if not discordLogo then
+				discordLogo = Instance.new("ImageLabel")
+				discordLogo.Name = "AireszDiscordLogo"
+				discordLogo.AnchorPoint =
+					Vector2.new(1, 0.5)
+				discordLogo.BackgroundTransparency = 1
+				discordLogo.Position =
+					UDim2.new(1, -39, 0.5, 0)
+				discordLogo.Size =
+					UDim2.fromOffset(22, 22)
+				discordLogo.Image =
+					"rbxassetid://18810599582"
+				discordLogo.ImageColor3 =
+					Color3.fromRGB(255, 255, 255)
+				discordLogo.ScaleType =
+					Enum.ScaleType.Fit
+				discordLogo.ZIndex = 10
+				discordLogo.Parent = discordCard
+			end
+
+			local discordArrow =
+				discordCard:FindFirstChild(
+					"AireszDiscordArrow"
+				)
+
+			if not discordArrow then
+				discordArrow = Instance.new("TextLabel")
+				discordArrow.Name = "AireszDiscordArrow"
+				discordArrow.AnchorPoint =
+					Vector2.new(1, 0.5)
+				discordArrow.BackgroundTransparency = 1
+				discordArrow.Position =
+					UDim2.new(1, -11, 0.5, -1)
+				discordArrow.Size =
+					UDim2.fromOffset(20, 24)
+				discordArrow.Font =
+					Enum.Font.GothamBold
+				discordArrow.Text = "›"
+				discordArrow.TextColor3 =
+					Color3.fromRGB(210, 214, 230)
+				discordArrow.TextSize = 22
+				discordArrow.ZIndex = 10
+				discordArrow.Parent = discordCard
+			end
+
+			local discordInteract =
+				findGuiButton(discordCard)
+
+			if discordInteract then
+				TrackConnection(
+					discordInteract
+						.MouseButton1Click
+						:Connect(function()
+							local inviteUrl, inviteCode =
+								normalizeDiscordInvite(
+									HomeTabSettings
+										.DiscordInvite
+								)
+
+							if not inviteUrl then
+								homeNotification(
+									"Discord unavailable",
+									"Discord invite is not configured.",
+									"error_outline"
+								)
+								return
+							end
+
+							copyHomeText(
+								inviteUrl,
+								"Discord copied",
+								"Discord invite copied to clipboard."
+							)
+
+							if type(request) == "function" then
+								pcall(request, {
+									Url =
+										"http://127.0.0.1:6463/rpc?v=1",
+									Method = "POST",
+									Headers = {
+										["Content-Type"] =
+											"application/json",
+										Origin =
+											"https://discord.com",
+									},
+									Body =
+										HttpService:JSONEncode({
+											cmd =
+												"INVITE_BROWSER",
+											nonce =
+												HttpService
+													:GenerateGUID(
+														false
+													),
+											args = {
+												code =
+													inviteCode,
+											},
+										}),
+								})
+							end
+						end),
+					homeConnections
+				)
+			end
+		end
+
+		local joinScriptButton =
+			findJoinScriptButton(HomeTabPage)
+
+		if joinScriptButton then
+			TrackConnection(
+				joinScriptButton.MouseButton1Click:Connect(
+					function()
+						local joinScript = string.format(
+							"game:GetService(%q)"
+							.. ":TeleportToPlaceInstance("
+							.. "%d, %q, "
+							.. "game:GetService(%q)"
+							.. ".LocalPlayer)",
+							"TeleportService",
+							game.PlaceId,
+							tostring(game.JobId),
+							"Players"
+						)
+
+						copyHomeText(
+							joinScript,
+							"Join script copied",
+							"Server join script copied to clipboard."
+						)
+					end
+				),
+				homeConnections
+			)
+		end
 
 		local function setPlayerCounts()
 			if not alive or not HomeTabPage.Parent then return end
