@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.7 - Autoload Toggle"
+local Release = "Luna Custom 7.3.9 - Manual Autoload Selection"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -773,38 +773,41 @@ local function EnhanceComponent(component)
 						or item:IsA("TextButton")
 						or item:IsA("TextBox")
 					then
-						if item:GetAttribute("LunaOriginalTextTransparency") == nil then
-							item:SetAttribute(
-								"LunaOriginalTextTransparency",
-								item.TextTransparency
-							)
+						local attribute = "LunaOriginalTextTransparency"
+						if disabled then
+							if item:GetAttribute(attribute) == nil then
+								item:SetAttribute(attribute, item.TextTransparency)
+							end
+							local original = item:GetAttribute(attribute) or 0
+							item.TextTransparency = math.max(original, 0.45)
+						else
+							local original = item:GetAttribute(attribute)
+							if original ~= nil then item.TextTransparency = original end
 						end
-						local original =
-							item:GetAttribute("LunaOriginalTextTransparency") or 0
-						item.TextTransparency =
-							disabled and math.max(original, 0.45) or original
 					elseif item:IsA("ImageLabel") or item:IsA("ImageButton") then
-						if item:GetAttribute("LunaOriginalImageTransparency") == nil then
-							item:SetAttribute(
-								"LunaOriginalImageTransparency",
-								item.ImageTransparency
-							)
+						local attribute = "LunaOriginalImageTransparency"
+						if disabled then
+							if item:GetAttribute(attribute) == nil then
+								item:SetAttribute(attribute, item.ImageTransparency)
+							end
+							local original = item:GetAttribute(attribute) or 0
+							item.ImageTransparency = math.max(original, 0.45)
+						else
+							local original = item:GetAttribute(attribute)
+							if original ~= nil then item.ImageTransparency = original end
 						end
-						local original =
-							item:GetAttribute("LunaOriginalImageTransparency") or 0
-						item.ImageTransparency =
-							disabled and math.max(original, 0.45) or original
 					elseif item:IsA("UIStroke") then
-						if item:GetAttribute("LunaOriginalStrokeTransparency") == nil then
-							item:SetAttribute(
-								"LunaOriginalStrokeTransparency",
-								item.Transparency
-							)
+						local attribute = "LunaOriginalStrokeTransparency"
+						if disabled then
+							if item:GetAttribute(attribute) == nil then
+								item:SetAttribute(attribute, item.Transparency)
+							end
+							local original = item:GetAttribute(attribute) or 0
+							item.Transparency = math.max(original, 0.7)
+						else
+							local original = item:GetAttribute(attribute)
+							if original ~= nil then item.Transparency = original end
 						end
-						local original =
-							item:GetAttribute("LunaOriginalStrokeTransparency") or 0
-						item.Transparency =
-							disabled and math.max(original, 0.7) or original
 					end
 				end
 			end
@@ -10050,8 +10053,10 @@ function Luna:CreateWindow(WindowSettings)
 				local currentAutoload = Luna:GetAutoload()
 				local selectedIsAutoload = selectedConfig ~= nil
 					and currentAutoload == selectedConfig
+				-- Keep the toggle visually available even when no config is selected.
+				-- Disabling it during its entrance tween could capture TextTransparency = 1
+				-- as the original value and make the title permanently invisible.
 				autoloadToggle:UpdateState(selectedIsAutoload, true)
-				autoloadToggle:SetDisabled(selectedConfig == nil)
 			end
 
 			local function makeBrowserRows(options)
@@ -10517,10 +10522,11 @@ function Luna:CreateWindow(WindowSettings)
 				end,
 			})
 
-			-- Select the current autoload config on startup so the toggle immediately
-			-- reflects its real state and can be switched off without another button.
-			refreshSelection(Luna:GetAutoload(), false)
-			syncAutoloadToggle()
+			-- Do not automatically select the saved autoload config when the panel opens.
+			-- The toggle must remain OFF until the user explicitly selects a config.
+			-- Existing autoload information is still shown by the Autoload Config label.
+			refreshSelection(nil, false)
+			autoloadToggle:UpdateState(false, true)
 			return {
 				Refresh = function(_, selectName) return refreshSelection(selectName, true) end,
 				GetSelected = function() return selectedConfig end,
