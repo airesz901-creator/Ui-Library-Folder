@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.3 - Legacy Config Browser"
+local Release = "Luna Custom 7.3.4 - Config Selection Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -10035,15 +10035,11 @@ function Luna:CreateWindow(WindowSettings)
 
 			local function makeBrowserRows(options)
 				local rows = {}
-				local currentAutoload = Luna:GetAutoload()
 				for _, name in ipairs(options) do
-					table.insert(rows, {
-						name,
-						currentAutoload == name and "Yes" or "",
-					})
+					table.insert(rows, {name})
 				end
 				if #rows == 0 then
-					table.insert(rows, {"No saved configs", ""})
+					table.insert(rows, {"No saved configs"})
 				end
 				return rows
 			end
@@ -10095,7 +10091,7 @@ function Luna:CreateWindow(WindowSettings)
 				if autoloadLabel then
 					local currentAutoload = Luna:GetAutoload()
 					autoloadLabel:Set({
-						Title = "Current Auto Load",
+						Title = "Autoload Config",
 						Text = currentAutoload or "None",
 					})
 				end
@@ -10131,10 +10127,11 @@ function Luna:CreateWindow(WindowSettings)
 			Tab:CreateSection("Saved Configs")
 			listStatus = Tab:CreateParagraph({Title = "Config List", Text = "Loading..."})
 			selectedLabel = Tab:CreateParagraph({Title = "Selected Config", Text = "None"})
+			autoloadLabel = Tab:CreateParagraph({Title = "Autoload Config", Text = "None"})
 
 			configSelection = Tab:CreateDropdown({
 				Name = "Select Config",
-				Description = "Old Luna-style config selector. Open it to choose a saved config.",
+				Description = "Open the list to choose a saved config. The chosen name appears above.",
 				Options = {},
 				CurrentOption = {},
 				MultipleOptions = false,
@@ -10143,10 +10140,33 @@ function Luna:CreateWindow(WindowSettings)
 				end,
 			})
 
+			local selectorPrompt = "Choose a saved config..."
+			local selectorObject = configSelection and configSelection._Object
+			local selectorTextBox = selectorObject and selectorObject:FindFirstChild("Selected")
+			local enforcingSelectorPrompt = false
+
+			local function keepSelectorPrompt()
+				if enforcingSelectorPrompt or not selectorTextBox or not selectorTextBox.Parent then return end
+				if selectorTextBox.PlaceholderText ~= selectorPrompt then
+					enforcingSelectorPrompt = true
+					selectorTextBox.PlaceholderText = selectorPrompt
+					enforcingSelectorPrompt = false
+				end
+			end
+
+			if selectorTextBox then
+				ConnectComponent(
+					configSelection,
+					selectorTextBox:GetPropertyChangedSignal("PlaceholderText"),
+					keepSelectorPrompt
+				)
+				keepSelectorPrompt()
+			end
+
 			if ConfigUISettings.ShowBrowser ~= false and type(Tab.CreateDataTable) == "function" then
 				configBrowser = Tab:CreateDataTable({
 					Name = "Saved Config Browser",
-					Columns = {"Config", "Autoload"},
+					Columns = {"Config"},
 					Rows = {},
 					Height = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190),
 					Searchable = ConfigUISettings.Searchable ~= false,
@@ -10220,7 +10240,6 @@ function Luna:CreateWindow(WindowSettings)
 				refreshSelection(nil, false)
 			end})
 
-			autoloadLabel = Tab:CreateParagraph({Title = "Current Auto Load", Text = "None"})
 			Tab:CreateButton({Name = "Set as Autoload", Description = "Automatically load the selected config next session.", Callback = function()
 				local name = requireSelected(); if not name then return end
 				local success, result = Luna:SetAutoload(name)
@@ -10601,6 +10620,9 @@ function Luna:CreateWindow(WindowSettings)
 			if not safe then
 				return nil, "Please provide a valid config name."
 			end
+			if safe:lower() == "autoload" then
+				return nil, 'The name "autoload" is reserved by Luna.'
+			end
 			return Luna.Folder
 				.. "/settings/"
 				.. safe
@@ -10899,7 +10921,7 @@ function Luna:CreateWindow(WindowSettings)
 
 			local function addName(name)
 				name = ConfigName(name)
-				if name and name ~= "autoload" and not seen[name] then
+				if name and name:lower() ~= "autoload" and not seen[name] then
 					seen[name] = true
 					table.insert(output, name)
 				end
