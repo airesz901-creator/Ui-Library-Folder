@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.4 - Config Selection Hotfix"
+local Release = "Luna Custom 7.3.5 - Config Browser Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -9986,6 +9986,7 @@ function Luna:CreateWindow(WindowSettings)
 			local selectedConfig
 			local deleteCandidate
 			local deleteCandidateTime = 0
+			local deleteAllCandidateTime = 0
 			local configSelection
 			local configBrowser
 			local selectedLabel
@@ -10025,22 +10026,31 @@ function Luna:CreateWindow(WindowSettings)
 
 			local function updateSelectedVisual(name)
 				selectedConfig = normalizeSelection(name)
+				if selectedConfig and selectedConfig:lower() == "nil" then
+					selectedConfig = nil
+				end
 				if selectedLabel then
 					selectedLabel:Set({
 						Title = "Selected Config",
 						Text = selectedConfig or "None",
 					})
 				end
+				if configBrowser and type(configBrowser.SetSelected) == "function" then
+					configBrowser:SetSelected(selectedConfig)
+				end
 			end
 
 			local function makeBrowserRows(options)
 				local rows = {}
-				for _, name in ipairs(options) do
-					table.insert(rows, {name})
+				local seen = {}
+				for _, rawName in ipairs(type(options) == "table" and options or {}) do
+					local name = normalizeSelection(rawName)
+					if name and name:lower() ~= "nil" and not seen[name] then
+						seen[name] = true
+						table.insert(rows, name)
+					end
 				end
-				if #rows == 0 then
-					table.insert(rows, {"No saved configs"})
-				end
+				table.sort(rows)
 				return rows
 			end
 
@@ -10163,21 +10173,183 @@ function Luna:CreateWindow(WindowSettings)
 				keepSelectorPrompt()
 			end
 
-			if ConfigUISettings.ShowBrowser ~= false and type(Tab.CreateDataTable) == "function" then
-				configBrowser = Tab:CreateDataTable({
-					Name = "Saved Config Browser",
-					Columns = {"Config"},
+			if ConfigUISettings.ShowBrowser ~= false then
+				local browserHeight = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190)
+				local browserCard = CreateCard(TabPage, "Saved Config Browser", browserHeight)
+				local browserTitle = CreateText(browserCard, "Saved Config Browser", 14, true)
+				browserTitle.Position = UDim2.fromOffset(14, 7)
+				browserTitle.Size = UDim2.new(1, -28, 0, 20)
+
+				local searchBox
+				local topOffset = 31
+				if ConfigUISettings.Searchable ~= false then
+					searchBox = Instance.new("TextBox")
+					searchBox.Name = "Search"
+					searchBox.BackgroundColor3 = Color3.fromRGB(23, 22, 28)
+					searchBox.BackgroundTransparency = 0.15
+					searchBox.BorderSizePixel = 0
+					searchBox.ClearTextOnFocus = false
+					searchBox.Font = Enum.Font.Gotham
+					searchBox.PlaceholderText = "Search saved configs..."
+					searchBox.PlaceholderColor3 = ProductivityColors.Muted
+					searchBox.Text = ""
+					searchBox.TextColor3 = ProductivityColors.Text
+					searchBox.TextSize = 12
+					searchBox.TextXAlignment = Enum.TextXAlignment.Left
+					searchBox.Position = UDim2.fromOffset(14, topOffset)
+					searchBox.Size = UDim2.new(1, -28, 0, 28)
+					searchBox.Parent = browserCard
+					CreateCorner(searchBox, 6)
+					CreatePadding(searchBox, 9, 9, 0, 0)
+					topOffset += 34
+				end
+
+				local rowsFrame = Instance.new("ScrollingFrame")
+				rowsFrame.Name = "SavedConfigs"
+				rowsFrame.BackgroundTransparency = 1
+				rowsFrame.BorderSizePixel = 0
+				rowsFrame.Position = UDim2.fromOffset(14, topOffset)
+				rowsFrame.Size = UDim2.new(1, -28, 1, -(topOffset + 12))
+				rowsFrame.ScrollBarThickness = 4
+				rowsFrame.ScrollBarImageColor3 = Color3.fromRGB(95, 93, 108)
+				rowsFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+				rowsFrame.CanvasSize = UDim2.new()
+				rowsFrame.Parent = browserCard
+
+				local rowsLayout = Instance.new("UIListLayout")
+				rowsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+				rowsLayout.Padding = UDim.new(0, 4)
+				rowsLayout.Parent = rowsFrame
+
+				local rowConnections = {}
+				local filterText = ""
+				local selectedName
+				local browser = {
+					Class = "ConfigBrowser",
 					Rows = {},
-					Height = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190),
-					Searchable = ConfigUISettings.Searchable ~= false,
-					Sortable = ConfigUISettings.Sortable ~= false,
-					OnRowSelected = function(row)
-						local name = normalizeSelection(type(row) == "table" and row[1] or row)
-						if not name then return end
-						updateSelectedVisual(name)
-						configSelection:Set({CurrentOption = {name}, Silent = true})
-					end,
-				})
+					Selected = nil,
+					_Object = browserCard,
+				}
+
+				local function renderBrowserRows()
+					DisconnectConnections(rowConnections)
+					for _, child in ipairs(rowsFrame:GetChildren()) do
+						if child:IsA("GuiObject") then child:Destroy() end
+					end
+
+					local visibleCount = 0
+					for _, rawName in ipairs(browser.Rows) do
+						local name = normalizeSelection(rawName)
+						if name and name:lower() ~= "nil"
+							and (filterText == "" or name:lower():find(filterText, 1, true))
+						then
+							visibleCount += 1
+							local isSelected = selectedName == name
+							local rowButton = Instance.new("TextButton")
+							rowButton.Name = "Config - " .. name
+							rowButton.AutoButtonColor = false
+							rowButton.BackgroundColor3 = isSelected
+								and Color3.fromRGB(55, 64, 76)
+								or (visibleCount % 2 == 0 and Color3.fromRGB(35, 33, 41) or Color3.fromRGB(30, 29, 36))
+							rowButton.BackgroundTransparency = isSelected and 0.05 or 0.25
+							rowButton.BorderSizePixel = 0
+							rowButton.Font = Enum.Font.Gotham
+							rowButton.Text = (isSelected and "✓  " or "   ") .. name
+							rowButton.TextColor3 = isSelected and Color3.fromRGB(240, 245, 255) or ProductivityColors.Text
+							rowButton.TextSize = 12
+							rowButton.TextXAlignment = Enum.TextXAlignment.Left
+							rowButton.Size = UDim2.new(1, -2, 0, 30)
+							rowButton.LayoutOrder = visibleCount
+							rowButton.Parent = rowsFrame
+							CreateCorner(rowButton, 5)
+							CreatePadding(rowButton, 10, 6, 0, 0)
+
+							TrackConnection(rowButton.MouseEnter:Connect(function()
+								if selectedName ~= name then
+									rowButton.BackgroundTransparency = 0.1
+								end
+							end), rowConnections)
+							TrackConnection(rowButton.MouseLeave:Connect(function()
+								if selectedName ~= name then
+									rowButton.BackgroundTransparency = 0.25
+								end
+							end), rowConnections)
+							TrackConnection(rowButton.MouseButton1Click:Connect(function()
+								selectedName = name
+								browser.Selected = name
+								renderBrowserRows()
+								updateSelectedVisual(name)
+								if configSelection then
+									configSelection:Set({CurrentOption = {name}, Silent = true})
+								end
+								browser:_EmitChanged(name, nil, {
+									Source = "ConfigBrowser",
+									Selected = true,
+									Force = true,
+								})
+							end), rowConnections)
+						end
+					end
+
+					if visibleCount == 0 then
+						local emptyLabel = CreateText(
+							rowsFrame,
+							filterText ~= "" and "No matching configs" or "No saved configs",
+							12,
+							false
+						)
+						emptyLabel.Name = "Empty"
+						emptyLabel.Size = UDim2.new(1, -2, 0, 34)
+						emptyLabel.TextColor3 = ProductivityColors.Muted
+						emptyLabel.TextXAlignment = Enum.TextXAlignment.Center
+					end
+				end
+
+				function browser:SetRows(rows)
+					self.Rows = makeBrowserRows(rows)
+					if selectedName and not table.find(self.Rows, selectedName) then
+						selectedName = nil
+						self.Selected = nil
+					end
+					renderBrowserRows()
+					return self
+				end
+
+				function browser:SetSelected(name)
+					name = normalizeSelection(name)
+					if name and not table.find(self.Rows, name) then name = nil end
+					selectedName = name
+					self.Selected = name
+					renderBrowserRows()
+					return self
+				end
+
+				function browser:GetSelected()
+					return selectedName
+				end
+
+				function browser:SetFilter(value)
+					filterText = tostring(value or ""):lower()
+					if searchBox and searchBox.Text ~= tostring(value or "") then
+						searchBox.Text = tostring(value or "")
+					end
+					renderBrowserRows()
+					return self
+				end
+
+				function browser:Destroy()
+					DisconnectConnections(rowConnections)
+					if browserCard.Parent then browserCard:Destroy() end
+				end
+
+				configBrowser = EnhanceComponent(browser)
+				if searchBox then
+					ConnectComponent(configBrowser, searchBox:GetPropertyChangedSignal("Text"), function()
+						filterText = searchBox.Text:lower()
+						renderBrowserRows()
+					end)
+				end
+				configBrowser:SetRows({})
 			end
 
 			Tab:CreateButton({
@@ -10237,6 +10409,30 @@ function Luna:CreateWindow(WindowSettings)
 				deleteCandidate = nil
 				if not success then notify("Unable to delete config: " .. tostring(result), "error"); return end
 				notify(string.format("Deleted config %q", name), "check_circle")
+				refreshSelection(nil, false)
+			end})
+
+			Tab:CreateButton({Name = "Delete All Configs", Description = "Press twice within 5 seconds to permanently delete every saved config.", Callback = function()
+				local options = Luna:RefreshConfigList()
+				if #options == 0 then
+					notify("There are no saved configs to delete.", "info")
+					return
+				end
+				if (os.clock() - deleteAllCandidateTime) > 5 then
+					deleteAllCandidateTime = os.clock()
+					notify(string.format("Press Delete All Configs again within 5 seconds to delete all %d config(s).", #options), "warning")
+					return
+				end
+
+				deleteAllCandidateTime = 0
+				local success, deletedCount, errors = Luna:DeleteAllConfigs()
+				updateSelectedVisual(nil)
+				if success then
+					notify(string.format("Deleted all %d saved config(s).", tonumber(deletedCount) or 0), "check_circle")
+				else
+					local failedCount = type(errors) == "table" and #errors or 0
+					notify(string.format("Deleted %d config(s), but %d could not be deleted.", tonumber(deletedCount) or 0, failedCount), "warning")
+				end
 				refreshSelection(nil, false)
 			end})
 
@@ -10620,8 +10816,9 @@ function Luna:CreateWindow(WindowSettings)
 			if not safe then
 				return nil, "Please provide a valid config name."
 			end
-			if safe:lower() == "autoload" then
-				return nil, 'The name "autoload" is reserved by Luna.'
+			local loweredName = safe:lower()
+			if loweredName == "autoload" or loweredName == "nil" then
+				return nil, ('The name %q is reserved by Luna.'):format(safe)
 			end
 			return Luna.Folder
 				.. "/settings/"
@@ -10921,7 +11118,7 @@ function Luna:CreateWindow(WindowSettings)
 
 			local function addName(name)
 				name = ConfigName(name)
-				if name and name:lower() ~= "autoload" and not seen[name] then
+				if name and name:lower() ~= "autoload" and name:lower() ~= "nil" and not seen[name] then
 					seen[name] = true
 					table.insert(output, name)
 				end
@@ -10971,6 +11168,30 @@ function Luna:CreateWindow(WindowSettings)
 
 			Luna._KnownConfigs[safeName] = nil
 			return true, safeName
+		end
+
+		function Luna:DeleteAllConfigs()
+			local configs = self:RefreshConfigList()
+			local deleted = {}
+			local errors = {}
+
+			for _, name in ipairs(configs) do
+				local success, result = self:DeleteConfig(name)
+				if success then
+					table.insert(deleted, result or name)
+				else
+					table.insert(errors, {
+						Config = name,
+						Error = tostring(result),
+					})
+				end
+			end
+
+			if #errors == 0 and self:GetAutoload() then
+				self:DeleteAutoload()
+			end
+
+			return #errors == 0, #deleted, errors
 		end
 
 		function Luna:RenameConfig(oldName, newName)
