@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.2.0 - Stability & Performance"
+local Release = "Luna Custom 7.3.0 - Productivity & Components"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -11,6 +11,10 @@ local Luna = {
 	NotificationBlurEnabled = false,
 	WindowBlurEnabled = true,
 	StrictConfig = false,
+	AnimationSpeed = 1,
+	ReducedMotion = false,
+	UIScale = 1,
+	MaxNotificationHistory = 50,
 }
 
 local UserInputService = game:GetService("UserInputService")
@@ -51,6 +55,11 @@ Luna._Destroyed = false
 Luna._NotificationQueue = {}
 Luna._ToggleGroups = {}
 Luna._MutatingToggleGroups = {}
+Luna._Events = {}
+Luna._NotificationHistory = {}
+Luna._NotificationById = {}
+Luna._Themes = {}
+Luna._Windows = setmetatable({}, {__mode = "k"})
 Luna._Stats = {
 	CallbackErrors = 0,
 	NotificationsCreated = 0,
@@ -59,6 +68,10 @@ Luna._Stats = {
 	DuplicateFlags = 0,
 	ConfigRollbacks = 0,
 	ConfigWarnings = 0,
+	EventsEmitted = 0,
+	ModalsOpened = 0,
+	CommandPaletteSearches = 0,
+	DependencyLinks = 0,
 }
 
 local function TrackConnection(connection, bucket)
@@ -450,6 +463,197 @@ function Luna:NormalizeToggleGroups(fireCallbacks)
 	return NormalizeAllToggleGroups(fireCallbacks == true)
 end
 
+
+local function ShallowCopy(source)
+	local output = {}
+	for key, value in pairs(type(source) == "table" and source or {}) do
+		output[key] = value
+	end
+	return output
+end
+
+local function DeepCopy(value, seen)
+	if type(value) ~= "table" then return value end
+	seen = seen or {}
+	if seen[value] then return seen[value] end
+	local output = {}
+	seen[value] = output
+	for key, item in pairs(value) do
+		output[DeepCopy(key, seen)] = DeepCopy(item, seen)
+	end
+	return output
+end
+
+local function ValuesEqual(a, b, seen)
+	if a == b then return true end
+	if type(a) ~= type(b) then return false end
+	if type(a) ~= "table" then return false end
+	seen = seen or {}
+	if seen[a] == b then return true end
+	seen[a] = b
+	for key, value in pairs(a) do
+		if not ValuesEqual(value, b[key], seen) then return false end
+	end
+	for key in pairs(b) do
+		if a[key] == nil then return false end
+	end
+	return true
+end
+
+local function EmitEvent(name, ...)
+	name = tostring(name or "")
+	if name == "" then return false end
+	Luna._Stats.EventsEmitted += 1
+	local bucket = Luna._Events[name]
+	if not bucket then return true end
+	local listeners = {}
+	for token, callback in pairs(bucket) do
+		table.insert(listeners, {Token = token, Callback = callback})
+	end
+	for _, listener in ipairs(listeners) do
+		if bucket[listener.Token] == listener.Callback then
+			SafeCall(listener.Callback, ...)
+		end
+	end
+	return true
+end
+
+function Luna:On(name, callback)
+	if type(callback) ~= "function" then
+		return nil, "Listener must be a function."
+	end
+	name = tostring(name or "")
+	if name == "" then return nil, "Event name is empty." end
+	local bucket = Luna._Events[name]
+	if not bucket then
+		bucket = {}
+		Luna._Events[name] = bucket
+	end
+	local token = HttpService:GenerateGUID(false)
+	bucket[token] = callback
+	local disconnected = false
+	return {
+		Disconnect = function()
+			if disconnected then return end
+			disconnected = true
+			if Luna._Events[name] then
+				Luna._Events[name][token] = nil
+				if next(Luna._Events[name]) == nil then
+					Luna._Events[name] = nil
+				end
+			end
+		end,
+	}
+end
+
+function Luna:Off(connection)
+	if connection and type(connection.Disconnect) == "function" then
+		connection.Disconnect()
+		return true
+	end
+	return false
+end
+
+function Luna:Once(name, callback)
+	local connection
+	connection = Luna:On(name, function(...)
+		if connection then connection.Disconnect() end
+		callback(...)
+	end)
+	return connection
+end
+
+function Luna:Emit(name, ...)
+	return EmitEvent(name, ...)
+end
+
+local function ReadComponentValue(component)
+	if not component or type(component.GetValue) ~= "function" then return nil end
+	local success, value = pcall(component.GetValue, component)
+	return success and value or nil
+end
+
+local function EmitComponentChanged(component, value, previous, metadata)
+	if not component or component._Destroyed then return false end
+	metadata = type(metadata) == "table" and metadata or {}
+	if previous == nil then previous = component._LastEmittedValue end
+	if component._LastEmittedInitialized
+		and ValuesEqual(component._LastEmittedValue, value)
+		and metadata.Force ~= true
+	then
+		return false
+	end
+	component._LastEmittedValue = DeepCopy(value)
+	component._LastEmittedInitialized = true
+	local listeners = component._ChangedListeners
+	if listeners then
+		local snapshot = {}
+		for token, callback in pairs(listeners) do
+			table.insert(snapshot, {Token = token, Callback = callback})
+		end
+		for _, listener in ipairs(snapshot) do
+			if listeners[listener.Token] == listener.Callback then
+				SafeCall(listener.Callback, value, previous, metadata)
+			end
+		end
+	end
+	EmitEvent("ComponentChanged", component, value, previous, metadata)
+	return true
+end
+
+local AttachTooltipToComponent
+
+function Luna:GetOption(flag)
+	return Luna.Options[tostring(flag or "")]
+end
+
+function Luna:GetValue(flag)
+	local option = self:GetOption(flag)
+	if not option then return nil, "Option does not exist." end
+	return ReadComponentValue(option)
+end
+
+function Luna:SetValue(flag, value, silent)
+	local option = self:GetOption(flag)
+	if not option or type(option.SetValue) ~= "function" then
+		return false, "Option does not support SetValue."
+	end
+	option:SetValue(value, silent == true)
+	return true, option
+end
+
+function Luna:SetValues(values, silent)
+	if type(values) ~= "table" then return false, "Values must be a table." end
+	local errors = {}
+	for flag, value in pairs(values) do
+		local success, result = self:SetValue(flag, value, silent == true)
+		if not success then errors[tostring(flag)] = result end
+	end
+	return next(errors) == nil, errors
+end
+
+function Luna:ResetOption(flag, silent)
+	local option = self:GetOption(flag)
+	if not option or type(option.Reset) ~= "function" then
+		return false, "Option cannot be reset."
+	end
+	option:Reset(silent == true)
+	return true, option
+end
+
+function Luna:ResetAll(silent)
+	local resetCount = 0
+	for _, option in pairs(Luna.Options) do
+		if type(option.Reset) == "function" then
+			option:Reset(silent == true)
+			resetCount += 1
+		end
+	end
+	NormalizeAllToggleGroups(false)
+	EmitEvent("AllOptionsReset", resetCount)
+	return true, resetCount
+end
+
 local ValueComponentClasses = {
 	Toggle = true,
 	Slider = true,
@@ -621,12 +825,141 @@ local function EnhanceComponent(component)
 		return self.Visible ~= false
 	end
 
+
+component._ChangedListeners = component._ChangedListeners or {}
+
+if not component.OnChanged then
+	function component:OnChanged(callback)
+		if type(callback) ~= "function" then
+			return nil, "Listener must be a function."
+		end
+		local token = HttpService:GenerateGUID(false)
+		self._ChangedListeners[token] = callback
+		local disconnected = false
+		return {
+			Disconnect = function()
+				if disconnected then return end
+				disconnected = true
+				if self._ChangedListeners then self._ChangedListeners[token] = nil end
+			end,
+		}
+	end
+end
+
+if not component._EmitChanged then
+	function component:_EmitChanged(value, previous, metadata)
+		return EmitComponentChanged(self, value, previous, metadata)
+	end
+end
+
+if component.Set and not component._ProductivitySetWrapped then
+	local originalSet = component.Set
+	component._ProductivitySetWrapped = true
+	function component:Set(settings, ...)
+		if self._Destroyed then return self end
+		local before = DeepCopy(ReadComponentValue(self))
+		local silent = type(settings) == "table" and settings.Silent == true
+		local result = originalSet(self, settings, ...)
+		local after = DeepCopy(ReadComponentValue(self))
+		if not ValuesEqual(before, after) then
+			self:_EmitChanged(after, before, {
+				Source = "Set",
+				Silent = silent,
+			})
+		end
+		return result == nil and self or result
+	end
+end
+
+if component._DefaultValue == nil and ValueComponentClasses[component.Class] then
+	component._DefaultValue = DeepCopy(ReadComponentValue(component))
+	component._LastEmittedValue = DeepCopy(component._DefaultValue)
+end
+
+if not component.Reset then
+	function component:Reset(silent)
+		if self._Destroyed then return self end
+		if self._DefaultValue ~= nil and type(self.SetValue) == "function" then
+			self:SetValue(DeepCopy(self._DefaultValue), silent == true)
+		end
+		return self
+	end
+end
+
+if not component.SetDefault then
+	function component:SetDefault(value)
+		self._DefaultValue = DeepCopy(value ~= nil and value or ReadComponentValue(self))
+		return self
+	end
+end
+
+if not component.SetTooltip then
+	function component:SetTooltip(tooltip)
+		self.Tooltip = tooltip
+		if AttachTooltipToComponent then
+			AttachTooltipToComponent(self, tooltip)
+		end
+		return self
+	end
+end
+
+if not component.DependsOn then
+	function component:DependsOn(source, expected, options)
+		if type(source) == "string" then source = Luna.Options[source] end
+		if not source or type(source.GetValue) ~= "function" or type(source.OnChanged) ~= "function" then
+			return nil, "Dependency source is invalid."
+		end
+
+		if type(expected) == "table" and options == nil then
+			options = expected
+			expected = options.Value
+		end
+		options = type(options) == "table" and options or {}
+		if expected == nil then expected = true end
+
+		local function matches(value)
+			if type(expected) == "function" then
+				local success, result = pcall(expected, value, source, self)
+				return success and result == true
+			end
+			return ValuesEqual(value, expected)
+		end
+
+		local function apply(value)
+			local active = matches(value)
+			if options.Invert == true then active = not active end
+			if options.Visible ~= false then self:SetVisible(active) end
+			if options.DisabledWhenFalse ~= false then self:SetDisabled(not active) end
+			if type(options.Callback) == "function" then
+				SafeCall(options.Callback, active, value, self, source)
+			end
+			return active
+		end
+
+		local connection = source:OnChanged(function(value)
+			apply(value)
+		end)
+		self._DependencyConnections = self._DependencyConnections or {}
+		table.insert(self._DependencyConnections, connection)
+		Luna._Stats.DependencyLinks += 1
+		apply(source:GetValue())
+		return connection
+	end
+end
+
 	if component.Destroy and not component._DestroyWrapped then
 		local originalDestroy = component.Destroy
 		component._DestroyWrapped = true
 		function component:Destroy(...)
 			if self._Destroyed then return end
 			self._Destroyed = true
+			if self._SearchEntry and self._Window and self._Window._SearchEntries then
+				self._Window._SearchEntries[self._SearchEntry.Id] = nil
+			end
+			for _, dependency in ipairs(self._DependencyConnections or {}) do
+				if dependency and type(dependency.Disconnect) == "function" then pcall(dependency.Disconnect) end
+			end
+			table.clear(self._DependencyConnections or {})
 			DisconnectConnections(self._Connections)
 			Luna._Components[self] = nil
 			return originalDestroy(self, ...)
@@ -664,6 +997,12 @@ function Luna:GetDiagnostics()
 		DuplicateFlags = Luna._Stats.DuplicateFlags,
 		ConfigRollbacks = Luna._Stats.ConfigRollbacks,
 		ConfigWarnings = Luna._Stats.ConfigWarnings,
+		EventsEmitted = Luna._Stats.EventsEmitted,
+		ModalsOpened = Luna._Stats.ModalsOpened,
+		CommandPaletteSearches = Luna._Stats.CommandPaletteSearches,
+		DependencyLinks = Luna._Stats.DependencyLinks,
+		NotificationHistory = #Luna._NotificationHistory,
+		RegisteredThemes = (function() local count = 0 for _ in pairs(Luna._Themes) do count += 1 end return count end)(),
 		ToggleGroups = groupCount,
 		MaxNotifications = Luna.MaxNotifications,
 		NotificationBlurEnabled = Luna.NotificationBlurEnabled,
@@ -2463,11 +2802,42 @@ local function UnpackColor(Color)
 	return Color3.fromRGB(Color.R, Color.G, Color.B)
 end
 
+local function ScaleTweenInfo(info)
+	info = info or tweeninfo
+	local scale = math.max(0, tonumber(Luna.AnimationSpeed) or 1)
+	if Luna.ReducedMotion then scale = 0 end
+	local duration = scale == 0 and 0 or math.max(0, info.Time * scale)
+	return TweenInfo.new(
+		duration,
+		info.EasingStyle,
+		info.EasingDirection,
+		info.RepeatCount,
+		info.Reverses,
+		info.DelayTime * scale
+	)
+end
+
+local ActiveTweens = setmetatable({}, {__mode = "k"})
+local function TweenGoalKey(goal)
+	local keys = {}
+	for key in pairs(type(goal) == "table" and goal or {}) do table.insert(keys, tostring(key)) end
+	table.sort(keys)
+	return table.concat(keys, "|")
+end
 local function tween(object, goal, callback, tweenin)
-	local animation = TweenService:Create(object, tweenin or tweeninfo, goal)
-	if type(callback) == "function" then
-		animation.Completed:Once(callback)
-	end
+	if not object then return nil end
+	local bucket = ActiveTweens[object]
+	if not bucket then bucket = {}; ActiveTweens[object] = bucket end
+	local goalKey = TweenGoalKey(goal)
+	local previous = bucket[goalKey]
+	if previous then pcall(function() previous:Cancel() end) end
+	local animation = TweenService:Create(object, ScaleTweenInfo(tweenin), goal)
+	bucket[goalKey] = animation
+	animation.Completed:Once(function(...)
+		if bucket[goalKey] == animation then bucket[goalKey] = nil end
+		if next(bucket) == nil then ActiveTweens[object] = nil end
+		if type(callback) == "function" then callback(...) end
+	end)
 	animation:Play()
 	return animation
 end
@@ -2511,7 +2881,7 @@ local function BlurModule(Frame)
 		end
 		local continue = IsNotNaN(camera:ScreenPointToRay(0,0).Origin.x)
 		while not continue do
-			RunService.RenderStepped:wait()
+			RunService.RenderStepped:Wait()
 			continue = IsNotNaN(camera:ScreenPointToRay(0,0).Origin.x)
 		end
 	end
@@ -2857,7 +3227,1610 @@ local Navigation = Main.Navigation
 local Tabs = Navigation.Tabs
 local Notifications = LunaUI.Notifications
 
+-- Luna 7.3 productivity and component extension layer.
+local ProductivityColors = {
+	Card = Color3.fromRGB(32, 30, 38),
+	CardHover = Color3.fromRGB(39, 37, 47),
+	Border = Color3.fromRGB(64, 61, 76),
+	Text = Color3.fromRGB(240, 240, 240),
+	Muted = Color3.fromRGB(165, 163, 175),
+	Success = Color3.fromRGB(76, 190, 125),
+	Warning = Color3.fromRGB(235, 177, 74),
+	Error = Color3.fromRGB(222, 92, 92),
+	Info = Color3.fromRGB(104, 154, 225),
+}
+
+local function CreateCorner(parent, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, tonumber(radius) or 7)
+	corner.Parent = parent
+	return corner
+end
+
+local function CreateStroke(parent, transparency)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = ProductivityColors.Border
+	stroke.Transparency = tonumber(transparency) or 0.45
+	stroke.Thickness = 1
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = parent
+	return stroke
+end
+
+local function CreatePadding(parent, left, right, top, bottom)
+	local padding = Instance.new("UIPadding")
+	padding.PaddingLeft = UDim.new(0, tonumber(left) or 0)
+	padding.PaddingRight = UDim.new(0, tonumber(right) or 0)
+	padding.PaddingTop = UDim.new(0, tonumber(top) or 0)
+	padding.PaddingBottom = UDim.new(0, tonumber(bottom) or 0)
+	padding.Parent = parent
+	return padding
+end
+
+local function CreateText(parent, text, size, bold)
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.BorderSizePixel = 0
+	label.Text = tostring(text or "")
+	label.TextColor3 = ProductivityColors.Text
+	label.TextTransparency = 0
+	label.Font = Luna.CurrentFont or (bold and Enum.Font.GothamSemibold or Enum.Font.Gotham)
+	label.TextSize = tonumber(size) or 14
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Parent = parent
+	return label
+end
+
+local function CreateCard(parent, name, height)
+	local card = Instance.new("Frame")
+	card.Name = tostring(name or "Luna Component")
+	card:SetAttribute("LunaProductivityCard", true)
+	card.BackgroundColor3 = ProductivityColors.Card
+	card.BackgroundTransparency = tonumber(Luna.ComponentTransparency) or 0.5
+	card.BorderSizePixel = 0
+	card.Size = UDim2.new(1, 0, 0, tonumber(height) or 58)
+	card.Visible = true
+	card.Parent = parent
+	CreateCorner(card, 8)
+	CreateStroke(card, 0.5)
+	return card
+end
+
+local function FindScrollingAncestor(object)
+	local current = object
+	while current do
+		if current:IsA("ScrollingFrame") then return current end
+		current = current.Parent
+	end
+	return nil
+end
+
+local TooltipRoot
+local TooltipTitle
+local TooltipContent
+local TooltipOwner
+local TooltipGeneration = 0
+
+local function EnsureTooltip()
+	if TooltipRoot and TooltipRoot.Parent then return TooltipRoot end
+	TooltipRoot = Instance.new("Frame")
+	TooltipRoot.Name = "LunaTooltip"
+	TooltipRoot.BackgroundColor3 = Color3.fromRGB(23, 22, 28)
+	TooltipRoot.BackgroundTransparency = 0.05
+	TooltipRoot.BorderSizePixel = 0
+	TooltipRoot.Size = UDim2.fromOffset(270, 70)
+	TooltipRoot.AutomaticSize = Enum.AutomaticSize.Y
+	TooltipRoot.Visible = false
+	TooltipRoot.ZIndex = 1200
+	TooltipRoot.Parent = LunaUI
+	CreateCorner(TooltipRoot, 8)
+	CreateStroke(TooltipRoot, 0.25)
+	CreatePadding(TooltipRoot, 12, 12, 9, 10)
+
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 3)
+	layout.Parent = TooltipRoot
+
+	TooltipTitle = CreateText(TooltipRoot, "Information", 14, true)
+	TooltipTitle.Name = "Title"
+	TooltipTitle.LayoutOrder = 1
+	TooltipTitle.Size = UDim2.new(1, 0, 0, 18)
+	TooltipTitle.ZIndex = 1201
+
+	TooltipContent = CreateText(TooltipRoot, "", 12, false)
+	TooltipContent.Name = "Content"
+	TooltipContent.LayoutOrder = 2
+	TooltipContent.Size = UDim2.new(1, 0, 0, 0)
+	TooltipContent.AutomaticSize = Enum.AutomaticSize.Y
+	TooltipContent.TextWrapped = true
+	TooltipContent.TextTransparency = 0.22
+	TooltipContent.TextYAlignment = Enum.TextYAlignment.Top
+	TooltipContent.ZIndex = 1201
+	return TooltipRoot
+end
+
+local function PositionTooltip(position)
+	local root = EnsureTooltip()
+	local camera = GetCurrentCamera()
+	local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+	local size = root.AbsoluteSize
+	local x = math.clamp(position.X + 14, 8, math.max(8, viewport.X - size.X - 8))
+	local y = math.clamp(position.Y + 18, 8, math.max(8, viewport.Y - size.Y - 8))
+	root.Position = UDim2.fromOffset(x, y)
+end
+
+local function NormalizeTooltip(tooltip, component)
+	if tooltip == nil or tooltip == false then return nil end
+	if type(tooltip) == "string" then
+		return {
+			Title = component and component.Settings and component.Settings.Name or "Information",
+			Content = tooltip,
+		}
+	end
+	if type(tooltip) == "table" then
+		return {
+			Title = tooltip.Title or (component and component.Settings and component.Settings.Name) or "Information",
+			Content = tooltip.Content or tooltip.Text or tooltip.Description or "",
+		}
+	end
+	return nil
+end
+
+local function ShowTooltip(component, tooltip, position)
+	local normalized = NormalizeTooltip(tooltip, component)
+	if not normalized then return false end
+	local root = EnsureTooltip()
+	TooltipOwner = component
+	TooltipTitle.Text = tostring(normalized.Title or "Information")
+	TooltipContent.Text = tostring(normalized.Content or "")
+	root.Visible = true
+	PositionTooltip(position or UserInputService:GetMouseLocation())
+	return true
+end
+
+local function HideTooltip(component)
+	if component and TooltipOwner ~= component then return end
+	TooltipGeneration += 1
+	TooltipOwner = nil
+	if TooltipRoot then TooltipRoot.Visible = false end
+end
+
+AttachTooltipToComponent = function(component, tooltip)
+	if not component or component._Destroyed then return component end
+	component.Tooltip = tooltip
+	if component._TooltipConnectionsAttached then return component end
+	local object = component._Object
+	if not object or not object:IsA("GuiObject") then return component end
+	component._TooltipConnectionsAttached = true
+	object.Active = true
+
+	ConnectComponent(component, object.MouseEnter, function()
+		if component.Tooltip then ShowTooltip(component, component.Tooltip) end
+	end)
+	ConnectComponent(component, object.MouseLeave, function()
+		HideTooltip(component)
+	end)
+	ConnectComponent(component, object.InputChanged, function(input)
+		if TooltipOwner == component and input.UserInputType == Enum.UserInputType.MouseMovement then
+			PositionTooltip(input.Position)
+		end
+	end)
+	ConnectComponent(component, object.InputBegan, function(input)
+		if input.UserInputType ~= Enum.UserInputType.Touch then return end
+		TooltipGeneration += 1
+		local generation = TooltipGeneration
+		task.delay(0.55, function()
+			if generation == TooltipGeneration and not component._Destroyed and component.Tooltip then
+				ShowTooltip(component, component.Tooltip, input.Position)
+			end
+		end)
+	end)
+	ConnectComponent(component, object.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then HideTooltip(component) end
+	end)
+	return component
+end
+
+TrackConnection(UserInputService.InputChanged:Connect(function(input)
+	if TooltipRoot and TooltipRoot.Visible and input.UserInputType == Enum.UserInputType.MouseMovement then
+		PositionTooltip(input.Position)
+	end
+end))
+
+local function StatusColor(statusType)
+	statusType = tostring(statusType or "Info"):lower()
+	if statusType == "success" or statusType == "online" or statusType == "connected" then
+		return ProductivityColors.Success
+	elseif statusType == "warning" or statusType == "pending" then
+		return ProductivityColors.Warning
+	elseif statusType == "error" or statusType == "offline" or statusType == "failed" then
+		return ProductivityColors.Error
+	end
+	return ProductivityColors.Info
+end
+
+local function FocusComponent(component)
+	if not component or component._Destroyed then return false end
+	if component._Tab and type(component._Tab.Activate) == "function" then
+		component._Tab:Activate()
+	end
+	local object = component._Object
+	if not object or not object.Parent then return false end
+	component:SetVisible(true)
+	local scrolling = FindScrollingAncestor(object)
+	if scrolling then
+		local relativeY = object.AbsolutePosition.Y - scrolling.AbsolutePosition.Y + scrolling.CanvasPosition.Y
+		scrolling.CanvasPosition = Vector2.new(scrolling.CanvasPosition.X, math.max(0, relativeY - 42))
+	end
+	local stroke = object:FindFirstChildWhichIsA("UIStroke")
+	if stroke then
+		local originalColor = stroke.Color
+		local originalTransparency = stroke.Transparency
+		stroke.Color = Color3.fromRGB(190, 205, 255)
+		stroke.Transparency = 0
+		task.delay(0.65, function()
+			if stroke and stroke.Parent then
+				stroke.Color = originalColor
+				stroke.Transparency = originalTransparency
+			end
+		end)
+	end
+	return true
+end
+
+local function SearchScore(entry, query)
+	query = tostring(query or ""):lower()
+	if query == "" then return 1 end
+	local name = tostring(entry.Name or ""):lower()
+	local description = tostring(entry.Description or ""):lower()
+	local category = tostring(entry.Category or ""):lower()
+	if name == query then return 1000 end
+	if name:sub(1, #query) == query then return 700 - #name end
+	local namePosition = name:find(query, 1, true)
+	if namePosition then return 500 - namePosition end
+	local descriptionPosition = description:find(query, 1, true)
+	if descriptionPosition then return 250 - descriptionPosition end
+	local categoryPosition = category:find(query, 1, true)
+	if categoryPosition then return 150 - categoryPosition end
+	local termsMatched = 0
+	for term in query:gmatch("%S+") do
+		if name:find(term, 1, true) or description:find(term, 1, true) or category:find(term, 1, true) then
+			termsMatched += 1
+		else
+			return 0
+		end
+	end
+	return termsMatched > 0 and (80 + termsMatched) or 0
+end
+
+local function RegisterSearchEntry(window, entry)
+	if not window or type(entry) ~= "table" then return nil end
+	window._SearchEntries = window._SearchEntries or {}
+	entry.Id = entry.Id or HttpService:GenerateGUID(false)
+	window._SearchEntries[entry.Id] = entry
+	return entry
+end
+
+local function AttachProductivityComponent(component, settings, context)
+	if type(component) ~= "table" then return component end
+	settings = type(settings) == "table" and settings or {}
+	context = type(context) == "table" and context or {}
+	component._Window = context.Window
+	component._Tab = context.Tab
+	component._TabName = context.Tab and (context.Tab._Name or context.Tab.Name) or context.TabName
+	component._Container = context.Container
+	component.ProductivityType = context.Type or component.ProductivityType or component.Class
+	local currentValue = ReadComponentValue(component)
+	if currentValue ~= nil then
+		component._DefaultValue = DeepCopy(currentValue)
+		component._LastEmittedValue = DeepCopy(currentValue)
+		component._LastEmittedInitialized = true
+	end
+
+	if not component.Focus then
+		function component:Focus()
+			return FocusComponent(self)
+		end
+	end
+
+	if settings.Tooltip then component:SetTooltip(settings.Tooltip) end
+	if settings.DependsOn then
+		local dependency = settings.DependsOn
+		if type(dependency) == "table" and dependency.Source then
+			component:DependsOn(dependency.Source, dependency.Value, dependency)
+		else
+			component:DependsOn(dependency, true)
+		end
+	end
+
+	local object = component._Object
+	if object and Luna.CurrentFont then
+		local descendants = object:GetDescendants()
+		table.insert(descendants, object)
+		for _, descendant in ipairs(descendants) do
+			if descendant:IsA("TextLabel") or descendant:IsA("TextButton") or descendant:IsA("TextBox") then
+				descendant.Font = Luna.CurrentFont
+			end
+		end
+	end
+	if context.Window and object then
+		component._SearchEntry = RegisterSearchEntry(context.Window, {
+			Name = settings.Name or settings.Title or object.Name or component.Flag or component.Class,
+			Description = settings.Description or settings.Tooltip or "",
+			Category = component._TabName or context.Category or "Component",
+			Component = component,
+			Action = function()
+				component:Focus()
+				if type(settings.CommandCallback) == "function" then SafeCall(settings.CommandCallback, component) end
+			end,
+		})
+	end
+	return component
+end
+
+local FactoryMethods = {
+	"CreateButton",
+	"CreateLabel",
+	"CreateParagraph",
+	"CreateSlider",
+	"CreateToggle",
+	"CreateBind",
+	"CreateInput",
+	"CreateDropdown",
+	"CreateColorPicker",
+}
+
+local function WrapContainerFactory(container, methodName, context)
+	local original = container[methodName]
+	if type(original) ~= "function" or container["_Wrapped_" .. methodName] then return end
+	container["_Wrapped_" .. methodName] = true
+	container[methodName] = function(self, settings, ...)
+		local supplied = type(settings) == "table" and settings or nil
+		local nextSettings = supplied and ShallowCopy(supplied) or settings
+		local originalCallback = supplied and supplied.Callback
+		local holder = {}
+
+		if supplied and type(originalCallback) == "function" then
+			nextSettings.Callback = function(value, ...)
+				local result = originalCallback(value, ...)
+				local component = holder.Component
+				if component then
+					component:_EmitChanged(
+						DeepCopy(ReadComponentValue(component) ~= nil and ReadComponentValue(component) or value),
+						component._LastEmittedValue,
+						{Source = "Callback", UserInput = true, Force = ReadComponentValue(component) == nil}
+					)
+				end
+				return result
+			end
+		end
+
+		local component = original(self, nextSettings, ...)
+		holder.Component = component
+		if type(component) == "table" then
+			component.ProductivityType = component.ProductivityType or methodName:gsub("^Create", "")
+			AttachProductivityComponent(component, nextSettings, context)
+		end
+		return component
+	end
+end
+
+local function CreateProgressBar(container, settings, flag, context)
+	settings = Kwargify({
+		Name = "Progress",
+		Description = nil,
+		Range = {0, 100},
+		CurrentValue = 0,
+		Status = "",
+		ShowPercentage = true,
+		Callback = function() end,
+	}, ShallowCopy(settings or {}))
+	local parent = context.Parent
+	local card = CreateCard(parent, tostring(settings.Name) .. " - Progress", settings.Description and 82 or 66)
+	local component = {
+		Class = "Slider",
+		ProductivityType = "ProgressBar",
+		IgnoreConfig = false,
+		Settings = settings,
+		CurrentValue = tonumber(settings.CurrentValue) or 0,
+		_Object = card,
+	}
+
+	local title = CreateText(card, settings.Name, 14, true)
+	title.Position = UDim2.fromOffset(14, 7)
+	title.Size = UDim2.new(1, -95, 0, 20)
+	local percent = CreateText(card, "0%", 12, true)
+	percent.Position = UDim2.new(1, -72, 0, 7)
+	percent.Size = UDim2.fromOffset(58, 20)
+	percent.TextXAlignment = Enum.TextXAlignment.Right
+	local status = CreateText(card, settings.Status or "", 11, false)
+	status.Position = UDim2.fromOffset(14, 26)
+	status.Size = UDim2.new(1, -28, 0, 16)
+	status.TextColor3 = ProductivityColors.Muted
+	status.Visible = tostring(settings.Status or "") ~= ""
+
+	local track = Instance.new("Frame")
+	track.Name = "Track"
+	track.BackgroundColor3 = Color3.fromRGB(20, 19, 24)
+	track.BackgroundTransparency = 0.15
+	track.BorderSizePixel = 0
+	track.Position = UDim2.new(0, 14, 1, -20)
+	track.Size = UDim2.new(1, -28, 0, 8)
+	track.Parent = card
+	CreateCorner(track, 4)
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.BackgroundColor3 = Color3.fromRGB(135, 178, 215)
+	fill.BorderSizePixel = 0
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.Parent = track
+	CreateCorner(fill, 4)
+	local gradient = Instance.new("UIGradient")
+	gradient.Color = Luna.ThemeGradient
+	gradient.Parent = fill
+
+	local function range()
+		local minimum = tonumber(settings.Range and settings.Range[1]) or 0
+		local maximum = tonumber(settings.Range and settings.Range[2]) or 100
+		if minimum > maximum then minimum, maximum = maximum, minimum end
+		return minimum, maximum
+	end
+
+	local function apply(value, silent)
+		local minimum, maximum = range()
+		value = math.clamp(tonumber(value) or minimum, minimum, maximum)
+		local previous = component.CurrentValue
+		component.CurrentValue = value
+		settings.CurrentValue = value
+		local alpha = maximum == minimum and 0 or (value - minimum) / (maximum - minimum)
+		fill.Size = UDim2.fromScale(math.clamp(alpha, 0, 1), 1)
+		percent.Text = settings.ShowPercentage == false and tostring(value) or string.format("%d%%", math.floor(alpha * 100 + 0.5))
+		percent.Visible = settings.ShowPercentage ~= false
+		if silent ~= true and previous ~= value then SafeCall(settings.Callback, value) end
+		component:_EmitChanged(value, previous, {Source = "ProgressBar", Silent = silent == true})
+		return component
+	end
+
+	function component:Set(newSettings)
+		newSettings = Kwargify(settings, ShallowCopy(newSettings or {}))
+		settings = newSettings
+		self.Settings = settings
+		title.Text = tostring(settings.Name)
+		self:SetStatus(settings.Status)
+		return apply(settings.CurrentValue, settings.Silent == true)
+	end
+	function component:SetValue(value, silent) return apply(value, silent == true) end
+	function component:GetValue() return self.CurrentValue end
+	function component:SetStatus(value)
+		settings.Status = tostring(value or "")
+		status.Text = settings.Status
+		status.Visible = settings.Status ~= ""
+		return self
+	end
+	function component:Complete(message)
+		local _, maximum = range()
+		if message ~= nil then self:SetStatus(message) end
+		return apply(maximum, false)
+	end
+	function component:Destroy()
+		RemoveOption(self)
+		if card.Parent then card:Destroy() end
+	end
+
+	if flag then RegisterOption(flag, component) end
+	component = EnhanceComponent(component)
+	component._DefaultValue = tonumber(settings.CurrentValue) or 0
+	AttachProductivityComponent(component, settings, context)
+	ConnectComponent(component, LunaUI.ThemeRemote:GetPropertyChangedSignal("Value"), function()
+		if gradient.Parent then gradient.Color = Luna.ThemeGradient end
+	end)
+	apply(settings.CurrentValue, true)
+	return component
+end
+
+local function CreateStatusComponent(container, settings, context)
+	settings = Kwargify({
+		Name = "Status",
+		Status = "Unknown",
+		Type = "Info",
+		Description = nil,
+	}, ShallowCopy(settings or {}))
+	local card = CreateCard(context.Parent, tostring(settings.Name) .. " - Status", settings.Description and 64 or 48)
+	local component = {Class = "Status", Settings = settings, _Object = card}
+	local dot = Instance.new("Frame")
+	dot.Name = "Dot"
+	dot.Position = UDim2.fromOffset(14, 17)
+	dot.Size = UDim2.fromOffset(10, 10)
+	dot.BorderSizePixel = 0
+	dot.Parent = card
+	CreateCorner(dot, 8)
+	local title = CreateText(card, settings.Name, 14, true)
+	title.Position = UDim2.fromOffset(34, 6)
+	title.Size = UDim2.new(0.55, -34, 0, 22)
+	local value = CreateText(card, settings.Status, 12, true)
+	value.Position = UDim2.new(0.55, 0, 0, 6)
+	value.Size = UDim2.new(0.45, -14, 0, 22)
+	value.TextXAlignment = Enum.TextXAlignment.Right
+	local description = CreateText(card, settings.Description or "", 11, false)
+	description.Position = UDim2.fromOffset(34, 29)
+	description.Size = UDim2.new(1, -48, 0, 17)
+	description.TextColor3 = ProductivityColors.Muted
+	description.Visible = settings.Description ~= nil and settings.Description ~= ""
+
+	function component:SetStatus(statusText, statusType)
+		local previous = settings.Status
+		settings.Status = tostring(statusText or "")
+		if statusType ~= nil then settings.Type = statusType end
+		value.Text = settings.Status
+		dot.BackgroundColor3 = StatusColor(settings.Type)
+		self:_EmitChanged(settings.Status, previous, {Source = "Status"})
+		return self
+	end
+	function component:GetValue() return settings.Status end
+	function component:Set(newSettings)
+		newSettings = Kwargify(settings, ShallowCopy(newSettings or {}))
+		settings = newSettings
+		self.Settings = settings
+		title.Text = tostring(settings.Name)
+		description.Text = tostring(settings.Description or "")
+		description.Visible = settings.Description ~= nil and settings.Description ~= ""
+		return self:SetStatus(settings.Status, settings.Type)
+	end
+	function component:Destroy() if card.Parent then card:Destroy() end end
+	component = EnhanceComponent(component)
+	AttachProductivityComponent(component, settings, context)
+	component:SetStatus(settings.Status, settings.Type)
+	return component
+end
+
+local function CreateImageCard(container, settings, context)
+	settings = Kwargify({
+		Title = "Image Card",
+		Name = nil,
+		Description = "",
+		Image = "view_in_ar",
+		ImageSource = "Material",
+		Badge = nil,
+		Callback = nil,
+	}, ShallowCopy(settings or {}))
+	settings.Name = settings.Name or settings.Title
+	local card = CreateCard(context.Parent, tostring(settings.Name) .. " - Card", 88)
+	local component = {Class = "ImageCard", Settings = settings, _Object = card}
+	local image = Instance.new("ImageLabel")
+	image.Name = "Image"
+	image.BackgroundColor3 = Color3.fromRGB(24, 23, 29)
+	image.BackgroundTransparency = 0.2
+	image.BorderSizePixel = 0
+	image.Position = UDim2.fromOffset(14, 14)
+	image.Size = UDim2.fromOffset(60, 60)
+	image.ScaleType = Enum.ScaleType.Fit
+	image.Parent = card
+	CreateCorner(image, 8)
+	ApplyIcon(image, settings.Image, settings.ImageSource)
+	local title = CreateText(card, settings.Title, 15, true)
+	title.Position = UDim2.fromOffset(86, 12)
+	title.Size = UDim2.new(1, -100, 0, 24)
+	local description = CreateText(card, settings.Description, 12, false)
+	description.Position = UDim2.fromOffset(86, 36)
+	description.Size = UDim2.new(1, -100, 0, 38)
+	description.TextWrapped = true
+	description.TextYAlignment = Enum.TextYAlignment.Top
+	description.TextColor3 = ProductivityColors.Muted
+	local badge = CreateText(card, settings.Badge or "", 10, true)
+	badge.BackgroundColor3 = ProductivityColors.Info
+	badge.BackgroundTransparency = 0.15
+	badge.Position = UDim2.new(1, -88, 0, 10)
+	badge.Size = UDim2.fromOffset(74, 20)
+	badge.TextXAlignment = Enum.TextXAlignment.Center
+	badge.Visible = settings.Badge ~= nil and settings.Badge ~= ""
+	CreateCorner(badge, 10)
+
+	local interact = Instance.new("TextButton")
+	interact.Name = "Interact"
+	interact.BackgroundTransparency = 1
+	interact.Text = ""
+	interact.Size = UDim2.fromScale(1, 1)
+	interact.ZIndex = 5
+	interact.Parent = card
+	if type(settings.Callback) == "function" then
+		ConnectComponent(component, interact.MouseButton1Click, function()
+			if IsComponentUsable(component) then SafeCall(settings.Callback, component) end
+		end)
+	end
+
+	function component:SetImage(icon, source)
+		settings.Image = icon
+		settings.ImageSource = source or settings.ImageSource
+		ApplyIcon(image, settings.Image, settings.ImageSource)
+		return self
+	end
+	function component:SetBadge(value, badgeType)
+		settings.Badge = tostring(value or "")
+		badge.Text = settings.Badge
+		badge.Visible = settings.Badge ~= ""
+		if badgeType then badge.BackgroundColor3 = StatusColor(badgeType) end
+		return self
+	end
+	function component:Set(newSettings)
+		newSettings = Kwargify(settings, ShallowCopy(newSettings or {}))
+		settings = newSettings
+		self.Settings = settings
+		title.Text = tostring(settings.Title or settings.Name)
+		description.Text = tostring(settings.Description or "")
+		self:SetImage(settings.Image, settings.ImageSource)
+		self:SetBadge(settings.Badge, settings.BadgeType)
+		return self
+	end
+	function component:Destroy() if card.Parent then card:Destroy() end end
+	component = EnhanceComponent(component)
+	AttachProductivityComponent(component, settings, context)
+	return component
+end
+
+local function CreateSegmentedControl(container, settings, flag, context)
+	settings = Kwargify({
+		Name = "Segmented Control",
+		Options = {"Option 1", "Option 2"},
+		CurrentOption = nil,
+		Callback = function() end,
+	}, ShallowCopy(settings or {}))
+	settings.CurrentOption = settings.CurrentOption or settings.Options[1]
+	if type(settings.CurrentOption) == "table" then settings.CurrentOption = settings.CurrentOption[1] end
+	local card = CreateCard(context.Parent, tostring(settings.Name) .. " - Segmented", 72)
+	local component = {
+		Class = "Dropdown",
+		ProductivityType = "SegmentedControl",
+		IgnoreConfig = false,
+		Settings = settings,
+		CurrentOption = {settings.CurrentOption},
+		_Object = card,
+	}
+	local title = CreateText(card, settings.Name, 13, true)
+	title.Position = UDim2.fromOffset(14, 6)
+	title.Size = UDim2.new(1, -28, 0, 20)
+	local holder = Instance.new("Frame")
+	holder.Name = "Segments"
+	holder.BackgroundColor3 = Color3.fromRGB(23, 22, 28)
+	holder.BackgroundTransparency = 0.12
+	holder.BorderSizePixel = 0
+	holder.Position = UDim2.fromOffset(14, 32)
+	holder.Size = UDim2.new(1, -28, 0, 28)
+	holder.Parent = card
+	CreateCorner(holder, 6)
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.VerticalAlignment = Enum.VerticalAlignment.Center
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = holder
+	local buttons = {}
+	local segmentConnections = {}
+
+	local function render()
+		DisconnectConnections(segmentConnections)
+		for _, child in ipairs(holder:GetChildren()) do
+			if child:IsA("TextButton") then child:Destroy() end
+		end
+		table.clear(buttons)
+		local count = math.max(1, #settings.Options)
+		for index, option in ipairs(settings.Options) do
+			local button = Instance.new("TextButton")
+			button.Name = tostring(option)
+			button.AutoButtonColor = false
+			button.BackgroundColor3 = Color3.fromRGB(70, 75, 92)
+			button.BackgroundTransparency = tostring(option) == tostring(component.CurrentOption[1]) and 0.15 or 1
+			button.BorderSizePixel = 0
+			button.Size = UDim2.new(1 / count, 0, 1, 0)
+			button.Font = Enum.Font.GothamMedium
+			button.Text = tostring(option)
+			button.TextColor3 = ProductivityColors.Text
+			button.TextSize = 11
+			button.LayoutOrder = index
+			button.Parent = holder
+			if index == 1 or index == count then CreateCorner(button, 6) end
+			buttons[tostring(option)] = button
+			TrackConnection(button.MouseButton1Click:Connect(function()
+				component:SetValue(option, false)
+			end), segmentConnections)
+		end
+	end
+
+	local function apply(value, silent)
+		if type(value) == "table" then value = value[1] end
+		if not table.find(settings.Options, value) then value = settings.Options[1] end
+		local previous = component.CurrentOption[1]
+		component.CurrentOption = {value}
+		settings.CurrentOption = value
+		for option, button in pairs(buttons) do
+			button.BackgroundTransparency = option == tostring(value) and 0.15 or 1
+		end
+		if silent ~= true and previous ~= value then SafeCall(settings.Callback, value) end
+		component:_EmitChanged(value, previous, {Source = "SegmentedControl", Silent = silent == true})
+		return component
+	end
+
+	function component:SetValue(value, silent) return apply(value, silent == true) end
+	function component:GetValue() return self.CurrentOption[1] end
+	function component:Set(newSettings)
+		newSettings = Kwargify(settings, ShallowCopy(newSettings or {}))
+		settings = newSettings
+		self.Settings = settings
+		title.Text = tostring(settings.Name)
+		if type(settings.Options) ~= "table" then settings.Options = {} end
+		render()
+		return apply(settings.CurrentOption, settings.Silent == true)
+	end
+	function component:SetOptions(options, silent)
+		settings.Options = type(options) == "table" and options or {}
+		render()
+		return apply(component.CurrentOption[1], silent == true)
+	end
+	function component:Destroy()
+		DisconnectConnections(segmentConnections)
+		RemoveOption(self)
+		if card.Parent then card:Destroy() end
+	end
+
+	if flag then RegisterOption(flag, component) end
+	component = EnhanceComponent(component)
+	component._DefaultValue = settings.CurrentOption
+	AttachProductivityComponent(component, settings, context)
+	render()
+	apply(settings.CurrentOption, true)
+	return component
+end
+
+local function CreateDataTable(container, settings, context)
+	settings = Kwargify({
+		Name = "Data Table",
+		Columns = {"Name", "Value"},
+		Rows = {},
+		Height = 220,
+		Searchable = true,
+		Sortable = true,
+		RowHeight = 28,
+		OnRowSelected = nil,
+	}, ShallowCopy(settings or {}))
+	local height = math.max(120, tonumber(settings.Height) or 220)
+	local card = CreateCard(context.Parent, tostring(settings.Name) .. " - Table", height)
+	local component = {Class = "DataTable", Settings = settings, Rows = {}, _Object = card}
+	local title = CreateText(card, settings.Name, 14, true)
+	title.Position = UDim2.fromOffset(14, 7)
+	title.Size = UDim2.new(1, -28, 0, 20)
+
+	local search
+	local topOffset = 31
+	if settings.Searchable ~= false then
+		search = Instance.new("TextBox")
+		search.Name = "Search"
+		search.BackgroundColor3 = Color3.fromRGB(23, 22, 28)
+		search.BackgroundTransparency = 0.15
+		search.BorderSizePixel = 0
+		search.ClearTextOnFocus = false
+		search.Font = Enum.Font.Gotham
+		search.PlaceholderText = "Search rows..."
+		search.PlaceholderColor3 = ProductivityColors.Muted
+		search.Text = ""
+		search.TextColor3 = ProductivityColors.Text
+		search.TextSize = 12
+		search.TextXAlignment = Enum.TextXAlignment.Left
+		search.Position = UDim2.fromOffset(14, topOffset)
+		search.Size = UDim2.new(1, -28, 0, 28)
+		search.Parent = card
+		CreateCorner(search, 6)
+		CreatePadding(search, 9, 9, 0, 0)
+		topOffset += 34
+	end
+
+	local header = Instance.new("Frame")
+	header.Name = "Header"
+	header.BackgroundColor3 = Color3.fromRGB(41, 39, 49)
+	header.BackgroundTransparency = 0.2
+	header.BorderSizePixel = 0
+	header.Position = UDim2.fromOffset(14, topOffset)
+	header.Size = UDim2.new(1, -28, 0, 28)
+	header.Parent = card
+	CreateCorner(header, 5)
+	local headerLayout = Instance.new("UIListLayout")
+	headerLayout.FillDirection = Enum.FillDirection.Horizontal
+	headerLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	headerLayout.Parent = header
+
+	local list = Instance.new("ScrollingFrame")
+	list.Name = "Rows"
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.Position = UDim2.fromOffset(14, topOffset + 32)
+	list.Size = UDim2.new(1, -28, 1, -(topOffset + 44))
+	list.ScrollBarThickness = 4
+	list.ScrollBarImageColor3 = Color3.fromRGB(95, 93, 108)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.CanvasSize = UDim2.new()
+	list.Parent = card
+	local rowLayout = Instance.new("UIListLayout")
+	rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	rowLayout.Padding = UDim.new(0, 3)
+	rowLayout.Parent = list
+
+	local filterText = ""
+	local sortColumn
+	local sortAscending = true
+	local rowConnections = {}
+	local headerConnections = {}
+
+	local function cellValue(row, index, column)
+		if type(row) ~= "table" then return index == 1 and row or "" end
+		if row[index] ~= nil then return row[index] end
+		if row[column] ~= nil then return row[column] end
+		return ""
+	end
+
+	local function renderRows()
+		DisconnectConnections(rowConnections)
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then child:Destroy() end
+		end
+		local rows = {}
+		for _, row in ipairs(component.Rows) do table.insert(rows, row) end
+		if sortColumn then
+			local columnName = settings.Columns[sortColumn]
+			table.sort(rows, function(a, b)
+				local av = cellValue(a, sortColumn, columnName)
+				local bv = cellValue(b, sortColumn, columnName)
+				local an, bn = tonumber(av), tonumber(bv)
+				local left, right = an and bn and an or tostring(av):lower(), an and bn and bn or tostring(bv):lower()
+				if sortAscending then return left < right else return left > right end
+			end)
+		end
+		local visibleIndex = 0
+		for _, row in ipairs(rows) do
+			local searchable = {}
+			for index, column in ipairs(settings.Columns) do
+				table.insert(searchable, tostring(cellValue(row, index, column)))
+			end
+			if filterText == "" or table.concat(searchable, " "):lower():find(filterText, 1, true) then
+				visibleIndex += 1
+				local rowFrame = Instance.new("TextButton")
+				rowFrame.Name = "Row " .. visibleIndex
+				rowFrame.AutoButtonColor = false
+				rowFrame.BackgroundColor3 = visibleIndex % 2 == 0 and Color3.fromRGB(35, 33, 41) or Color3.fromRGB(30, 29, 36)
+				rowFrame.BackgroundTransparency = 0.25
+				rowFrame.BorderSizePixel = 0
+				rowFrame.Text = ""
+				rowFrame.Size = UDim2.new(1, -2, 0, tonumber(settings.RowHeight) or 28)
+				rowFrame.LayoutOrder = visibleIndex
+				rowFrame.Parent = list
+				CreateCorner(rowFrame, 4)
+				local layout = Instance.new("UIListLayout")
+				layout.FillDirection = Enum.FillDirection.Horizontal
+				layout.SortOrder = Enum.SortOrder.LayoutOrder
+				layout.Parent = rowFrame
+				for index, column in ipairs(settings.Columns) do
+					local cell = CreateText(rowFrame, cellValue(row, index, column), 11, false)
+					cell.LayoutOrder = index
+					cell.Size = UDim2.new(1 / math.max(1, #settings.Columns), -4, 1, 0)
+					cell.TextTruncate = Enum.TextTruncate.AtEnd
+					CreatePadding(cell, 8, 4, 0, 0)
+				end
+				TrackConnection(rowFrame.MouseButton1Click:Connect(function()
+					if type(settings.OnRowSelected) == "function" then SafeCall(settings.OnRowSelected, row, component) end
+					component:_EmitChanged(row, nil, {Source = "DataTable", RowSelected = true, Force = true})
+				end), rowConnections)
+			end
+		end
+	end
+
+	local function renderHeader()
+		DisconnectConnections(headerConnections)
+		for _, child in ipairs(header:GetChildren()) do
+			if child:IsA("GuiObject") then child:Destroy() end
+		end
+		for index, column in ipairs(settings.Columns) do
+			local button = Instance.new("TextButton")
+			button.Name = tostring(column)
+			button.AutoButtonColor = false
+			button.BackgroundTransparency = 1
+			button.BorderSizePixel = 0
+			button.Font = Enum.Font.GothamSemibold
+			button.Text = tostring(column)
+			button.TextColor3 = ProductivityColors.Text
+			button.TextSize = 11
+			button.TextXAlignment = Enum.TextXAlignment.Left
+			button.Size = UDim2.new(1 / math.max(1, #settings.Columns), -4, 1, 0)
+			button.LayoutOrder = index
+			button.Parent = header
+			CreatePadding(button, 8, 4, 0, 0)
+			if settings.Sortable ~= false then
+				TrackConnection(button.MouseButton1Click:Connect(function()
+					if sortColumn == index then sortAscending = not sortAscending else sortColumn, sortAscending = index, true end
+					renderRows()
+				end), headerConnections)
+			end
+		end
+	end
+
+	function component:SetRows(rows)
+		self.Rows = type(rows) == "table" and DeepCopy(rows) or {}
+		settings.Rows = self.Rows
+		renderRows()
+		return self
+	end
+	function component:AddRow(row)
+		table.insert(self.Rows, DeepCopy(row))
+		renderRows()
+		return self
+	end
+	function component:Clear()
+		table.clear(self.Rows)
+		renderRows()
+		return self
+	end
+	function component:SetFilter(value)
+		filterText = tostring(value or ""):lower()
+		if search and search.Text ~= tostring(value or "") then search.Text = tostring(value or "") end
+		renderRows()
+		return self
+	end
+	function component:SortBy(column, ascending)
+		if type(column) == "string" then column = table.find(settings.Columns, column) end
+		sortColumn = tonumber(column)
+		sortAscending = ascending ~= false
+		renderRows()
+		return self
+	end
+	function component:GetRows() return DeepCopy(self.Rows) end
+	function component:Set(newSettings)
+		newSettings = Kwargify(settings, ShallowCopy(newSettings or {}))
+		settings = newSettings
+		self.Settings = settings
+		title.Text = tostring(settings.Name)
+		renderHeader()
+		return self:SetRows(settings.Rows)
+	end
+	function component:Destroy()
+		DisconnectConnections(rowConnections)
+		DisconnectConnections(headerConnections)
+		if card.Parent then card:Destroy() end
+	end
+
+	component = EnhanceComponent(component)
+	AttachProductivityComponent(component, settings, context)
+	if search then
+		ConnectComponent(component, search:GetPropertyChangedSignal("Text"), function()
+			filterText = search.Text:lower()
+			renderRows()
+		end)
+	end
+	renderHeader()
+	component:SetRows(settings.Rows)
+	return component
+end
+
+local function EnhanceCollapsibleSection(section, settings)
+	if not section or not section._Header or section._CollapsibleEnhanced then return section end
+	section._CollapsibleEnhanced = true
+	settings = type(settings) == "table" and settings or {}
+	local header = section._Header
+	local arrow = CreateText(header, "▾", 14, true)
+	arrow.Name = "CollapseArrow"
+	arrow.TextXAlignment = Enum.TextXAlignment.Right
+	arrow.Position = UDim2.new(1, -28, 0, 0)
+	arrow.Size = UDim2.fromOffset(22, math.max(22, header.AbsoluteSize.Y))
+	arrow.ZIndex = header.ZIndex + 2
+	local button = Instance.new("TextButton")
+	button.Name = "CollapseInteract"
+	button.BackgroundTransparency = 1
+	button.Text = ""
+	button.Size = UDim2.fromScale(1, 1)
+	button.ZIndex = header.ZIndex + 1
+	button.Parent = header
+
+	local baseSetCollapsed = section.SetCollapsed
+	function section:SetCollapsed(collapsed)
+		baseSetCollapsed(self, collapsed)
+		arrow.Text = self.Collapsed and "▸" or "▾"
+		EmitEvent("SectionCollapsed", self, self.Collapsed)
+		return self
+	end
+	ConnectComponent(section, button.MouseButton1Click, function()
+		section:Toggle()
+	end)
+	if settings.Tooltip then section:SetTooltip(settings.Tooltip) end
+	section:SetCollapsed(settings.DefaultExpanded == false or settings.Collapsed == true)
+	if section._Window then
+		section._SearchEntry = RegisterSearchEntry(section._Window, {
+			Name = section.Name,
+			Description = settings.Description or "Open section",
+			Category = section._Tab and section._Tab._Name or "Sections",
+			Component = section,
+			Action = function() FocusComponent(section) end,
+		})
+	end
+	return section
+end
+
+local function EnhanceContainerAPI(container, parent, window, tab, metadata)
+	if not container or container._ProductivityContainerEnhanced then return container end
+	container._ProductivityContainerEnhanced = true
+	metadata = type(metadata) == "table" and metadata or {}
+	container._Parent = parent
+	container._Window = window
+	container._Tab = tab
+	local context = {
+		Parent = parent,
+		Window = window,
+		Tab = tab,
+		Container = container,
+		Category = metadata.Name,
+	}
+
+	for _, methodName in ipairs(FactoryMethods) do
+		WrapContainerFactory(container, methodName, context)
+	end
+
+	function container:CreateProgressBar(settings, flag)
+		return CreateProgressBar(self, settings, flag, context)
+	end
+	function container:CreateStatus(settings)
+		return CreateStatusComponent(self, settings, context)
+	end
+	function container:CreateImageCard(settings)
+		return CreateImageCard(self, settings, context)
+	end
+	function container:CreateSegmentedControl(settings, flag)
+		return CreateSegmentedControl(self, settings, flag, context)
+	end
+	function container:CreateDataTable(settings)
+		return CreateDataTable(self, settings, context)
+	end
+	function container:CreateTable(settings)
+		return self:CreateDataTable(settings)
+	end
+	function container:CreateListView(settings)
+		settings = ShallowCopy(settings or {})
+		settings.Columns = settings.Columns or {settings.ColumnName or "Item"}
+		return self:CreateDataTable(settings)
+	end
+
+	if metadata.IsTab then
+		function container:CreateCollapsibleSection(settings)
+			settings = type(settings) == "table" and settings or {Name = settings}
+			if settings.DefaultExpanded == nil then settings.DefaultExpanded = false end
+			return self:CreateSection(settings)
+		end
+	end
+	return container
+end
+
+local function CreateModalOverlay(window, data)
+	data = Kwargify({
+		Title = "Confirmation",
+		Content = "",
+		ConfirmText = "Confirm",
+		CancelText = "Cancel",
+		ShowCancel = true,
+		Input = false,
+		Placeholder = "Type here...",
+		CurrentValue = "",
+		CloseOnBackground = false,
+		Callback = nil,
+	}, ShallowCopy(data or {}))
+	Luna._Stats.ModalsOpened += 1
+	local handle = {Closed = false, Result = nil}
+	local resolved = Instance.new("BindableEvent")
+	local connections = {}
+
+	local overlay = Instance.new("Frame")
+	overlay.Name = "LunaModal"
+	overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+	overlay.BackgroundTransparency = 0.38
+	overlay.BorderSizePixel = 0
+	overlay.Size = UDim2.fromScale(1, 1)
+	overlay.ZIndex = 800
+	overlay.Parent = LunaUI
+
+	local background = Instance.new("TextButton")
+	background.Name = "Background"
+	background.BackgroundTransparency = 1
+	background.Text = ""
+	background.Size = UDim2.fromScale(1, 1)
+	background.ZIndex = 800
+	background.Parent = overlay
+
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.Size = UDim2.new(0, 420, 0, data.Input and 235 or 185)
+	panel.BackgroundColor3 = Color3.fromRGB(28, 27, 34)
+	panel.BackgroundTransparency = 0.02
+	panel.BorderSizePixel = 0
+	panel.ZIndex = 802
+	panel.Parent = overlay
+	CreateCorner(panel, 11)
+	CreateStroke(panel, 0.22)
+
+	local title = CreateText(panel, data.Title, 18, true)
+	title.Position = UDim2.fromOffset(20, 15)
+	title.Size = UDim2.new(1, -40, 0, 28)
+	title.ZIndex = 803
+	local content = CreateText(panel, data.Content, 13, false)
+	content.Position = UDim2.fromOffset(20, 48)
+	content.Size = UDim2.new(1, -40, 0, data.Input and 58 or 72)
+	content.TextWrapped = true
+	content.TextYAlignment = Enum.TextYAlignment.Top
+	content.TextColor3 = ProductivityColors.Muted
+	content.ZIndex = 803
+
+	local inputBox
+	if data.Input then
+		inputBox = Instance.new("TextBox")
+		inputBox.Name = "Input"
+		inputBox.BackgroundColor3 = Color3.fromRGB(20, 19, 25)
+		inputBox.BackgroundTransparency = 0.08
+		inputBox.BorderSizePixel = 0
+		inputBox.ClearTextOnFocus = false
+		inputBox.Font = Enum.Font.Gotham
+		inputBox.PlaceholderText = tostring(data.Placeholder)
+		inputBox.PlaceholderColor3 = ProductivityColors.Muted
+		inputBox.Text = tostring(data.CurrentValue or "")
+		inputBox.TextColor3 = ProductivityColors.Text
+		inputBox.TextSize = 13
+		inputBox.TextXAlignment = Enum.TextXAlignment.Left
+		inputBox.Position = UDim2.fromOffset(20, 112)
+		inputBox.Size = UDim2.new(1, -40, 0, 36)
+		inputBox.ZIndex = 803
+		inputBox.Parent = panel
+		CreateCorner(inputBox, 7)
+		CreateStroke(inputBox, 0.55)
+		CreatePadding(inputBox, 10, 10, 0, 0)
+	end
+
+	local buttons = Instance.new("Frame")
+	buttons.Name = "Buttons"
+	buttons.BackgroundTransparency = 1
+	buttons.Position = UDim2.new(0, 20, 1, -54)
+	buttons.Size = UDim2.new(1, -40, 0, 36)
+	buttons.ZIndex = 803
+	buttons.Parent = panel
+	local buttonLayout = Instance.new("UIListLayout")
+	buttonLayout.FillDirection = Enum.FillDirection.Horizontal
+	buttonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+	buttonLayout.Padding = UDim.new(0, 8)
+	buttonLayout.Parent = buttons
+
+	local function makeButton(name, text, primary)
+		local button = Instance.new("TextButton")
+		button.Name = name
+		button.AutoButtonColor = false
+		button.BackgroundColor3 = primary and Color3.fromRGB(74, 100, 136) or Color3.fromRGB(45, 43, 53)
+		button.BackgroundTransparency = primary and 0.05 or 0.2
+		button.BorderSizePixel = 0
+		button.Font = Enum.Font.GothamSemibold
+		button.Text = tostring(text)
+		button.TextColor3 = ProductivityColors.Text
+		button.TextSize = 12
+		button.Size = UDim2.fromOffset(math.max(92, #tostring(text) * 8 + 28), 36)
+		button.ZIndex = 804
+		button.Parent = buttons
+		CreateCorner(button, 7)
+		return button
+	end
+	local cancel = data.ShowCancel ~= false and makeButton("Cancel", data.CancelText, false) or nil
+	local confirm = makeButton("Confirm", data.ConfirmText, true)
+
+	function handle:Close(result)
+		if self.Closed then return self.Result end
+		self.Closed = true
+		self.Result = result
+		for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+		table.clear(connections)
+		if overlay.Parent then overlay:Destroy() end
+		if window._ActiveModal == self then window._ActiveModal = nil end
+		resolved:Fire(result)
+		if type(data.Callback) == "function" then SafeCall(data.Callback, result, self) end
+		EmitEvent("ModalClosed", window, self, result)
+		task.defer(function() resolved:Destroy() end)
+		return result
+	end
+	function handle:Await()
+		if self.Closed then return self.Result end
+		return resolved.Event:Wait()
+	end
+	function handle:GetInput()
+		return inputBox and inputBox.Text or nil
+	end
+	function handle:SetContent(value)
+		content.Text = tostring(value or "")
+		return self
+	end
+	function handle:SetTitle(value)
+		title.Text = tostring(value or "")
+		return self
+	end
+
+	table.insert(connections, confirm.MouseButton1Click:Connect(function()
+		handle:Close(inputBox and inputBox.Text or true)
+	end))
+	if cancel then
+		table.insert(connections, cancel.MouseButton1Click:Connect(function() handle:Close(false) end))
+	end
+	if data.CloseOnBackground then
+		table.insert(connections, background.MouseButton1Click:Connect(function() handle:Close(false) end))
+	end
+	table.insert(connections, UserInputService.InputBegan:Connect(function(input)
+		if handle.Closed then return end
+		if input.KeyCode == Enum.KeyCode.Escape then handle:Close(false) end
+	end))
+	if inputBox then task.defer(function() if inputBox.Parent then inputBox:CaptureFocus() end end) end
+	EmitEvent("ModalOpened", window, handle, data)
+	return handle
+end
+
+local function EnhanceWindowProductivity(window, settings)
+	if not window or window._ProductivityEnhanced then return window end
+	window._ProductivityEnhanced = true
+	window._Tabs = window._Tabs or {}
+	window._SearchEntries = window._SearchEntries or {}
+	window._Commands = window._Commands or {}
+	window.CommandPaletteKeybind = Enum.KeyCode.K
+	window.CommandPaletteModifier = Enum.KeyCode.LeftControl
+
+	function window:_RegisterTab(tab)
+		if not tab then return end
+		self._Tabs[tostring(tab._Name or #self._Tabs + 1)] = tab
+		RegisterSearchEntry(self, {
+			Name = tostring(tab._Name or "Tab"),
+			Description = "Open tab",
+			Category = "Tabs",
+			Action = function() if type(tab.Activate) == "function" then tab:Activate() end end,
+		})
+		EmitEvent("TabRegistered", self, tab)
+	end
+
+	function window:RegisterCommand(commandSettings)
+		commandSettings = type(commandSettings) == "table" and commandSettings or {Name = commandSettings}
+		local id = tostring(commandSettings.Id or HttpService:GenerateGUID(false))
+		local entry = RegisterSearchEntry(self, {
+			Id = id,
+			Name = commandSettings.Name or id,
+			Description = commandSettings.Description or "",
+			Category = commandSettings.Category or "Commands",
+			Action = commandSettings.Callback or commandSettings.Action or function() end,
+		})
+		self._Commands[id] = entry
+		return entry
+	end
+
+	function window:UnregisterCommand(id)
+		id = tostring(id or "")
+		self._Commands[id] = nil
+		self._SearchEntries[id] = nil
+		return true
+	end
+
+	function window:Search(query, limit)
+		Luna._Stats.CommandPaletteSearches += 1
+		local results = {}
+		for _, entry in pairs(self._SearchEntries) do
+			local score = SearchScore(entry, query)
+			if score > 0 then
+				table.insert(results, {Entry = entry, Score = score})
+			end
+		end
+		table.sort(results, function(a, b)
+			if a.Score == b.Score then return tostring(a.Entry.Name) < tostring(b.Entry.Name) end
+			return a.Score > b.Score
+		end)
+		local output = {}
+		for index = 1, math.min(#results, math.max(1, tonumber(limit) or 12)) do
+			table.insert(output, results[index].Entry)
+		end
+		EmitEvent("CommandPaletteSearched", self, query, output)
+		return output
+	end
+
+	function window:OpenModal(data)
+		if self._ActiveModal and not self._ActiveModal.Closed then self._ActiveModal:Close(false) end
+		self._ActiveModal = CreateModalOverlay(self, data)
+		return self._ActiveModal
+	end
+	function window:Confirm(data)
+		data = ShallowCopy(data or {})
+		data.Input = false
+		return self:OpenModal(data)
+	end
+	function window:Prompt(data)
+		data = ShallowCopy(data or {})
+		data.Input = true
+		return self:OpenModal(data)
+	end
+
+	function window:SetCommandPaletteKeybind(keybind, modifier)
+		local binding, err = NormalizeInputBinding(keybind)
+		if not binding or binding.Kind ~= "KeyCode" then return false, err or "KeyCode required." end
+		self.CommandPaletteKeybind = binding.EnumItem
+		if modifier ~= nil then
+			local modifierBinding, modifierError = NormalizeInputBinding(modifier)
+			if not modifierBinding or modifierBinding.Kind ~= "KeyCode" then return false, modifierError end
+			self.CommandPaletteModifier = modifierBinding.EnumItem
+		end
+		return true
+	end
+
+	function window:OpenCommandPalette(initialQuery)
+		if self._Palette and not self._Palette.Closed then
+			if self._Palette.Input then self._Palette.Input:CaptureFocus() end
+			return self._Palette
+		end
+		local palette = {Closed = false}
+		local overlay = Instance.new("Frame")
+		overlay.Name = "LunaCommandPalette"
+		overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+		overlay.BackgroundTransparency = 0.42
+		overlay.BorderSizePixel = 0
+		overlay.Size = UDim2.fromScale(1, 1)
+		overlay.ZIndex = 850
+		overlay.Parent = LunaUI
+		local background = Instance.new("TextButton")
+		background.BackgroundTransparency = 1
+		background.Text = ""
+		background.Size = UDim2.fromScale(1, 1)
+		background.ZIndex = 850
+		background.Parent = overlay
+		local panel = Instance.new("Frame")
+		panel.AnchorPoint = Vector2.new(0.5, 0)
+		panel.Position = UDim2.new(0.5, 0, 0, 72)
+		panel.Size = UDim2.fromOffset(500, 410)
+		panel.BackgroundColor3 = Color3.fromRGB(27, 26, 33)
+		panel.BackgroundTransparency = 0.01
+		panel.BorderSizePixel = 0
+		panel.ZIndex = 852
+		panel.Parent = overlay
+		CreateCorner(panel, 11)
+		CreateStroke(panel, 0.2)
+		local input = Instance.new("TextBox")
+		input.Name = "Search"
+		input.BackgroundColor3 = Color3.fromRGB(20, 19, 25)
+		input.BackgroundTransparency = 0.05
+		input.BorderSizePixel = 0
+		input.ClearTextOnFocus = false
+		input.Font = Enum.Font.GothamMedium
+		input.PlaceholderText = "Search components and commands..."
+		input.PlaceholderColor3 = ProductivityColors.Muted
+		input.Text = tostring(initialQuery or "")
+		input.TextColor3 = ProductivityColors.Text
+		input.TextSize = 14
+		input.TextXAlignment = Enum.TextXAlignment.Left
+		input.Position = UDim2.fromOffset(14, 14)
+		input.Size = UDim2.new(1, -28, 0, 42)
+		input.ZIndex = 853
+		input.Parent = panel
+		CreateCorner(input, 8)
+		CreateStroke(input, 0.55)
+		CreatePadding(input, 12, 12, 0, 0)
+		local resultsFrame = Instance.new("ScrollingFrame")
+		resultsFrame.Name = "Results"
+		resultsFrame.BackgroundTransparency = 1
+		resultsFrame.BorderSizePixel = 0
+		resultsFrame.Position = UDim2.fromOffset(14, 66)
+		resultsFrame.Size = UDim2.new(1, -28, 1, -80)
+		resultsFrame.ScrollBarThickness = 4
+		resultsFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		resultsFrame.CanvasSize = UDim2.new()
+		resultsFrame.ZIndex = 853
+		resultsFrame.Parent = panel
+		local layout = Instance.new("UIListLayout")
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Padding = UDim.new(0, 5)
+		layout.Parent = resultsFrame
+		local connections = {}
+		local resultConnections = {}
+
+		function palette:Close()
+			if self.Closed then return end
+			self.Closed = true
+			for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+			for _, connection in ipairs(resultConnections) do pcall(function() connection:Disconnect() end) end
+			table.clear(connections)
+			table.clear(resultConnections)
+			if overlay.Parent then overlay:Destroy() end
+			window._Palette = nil
+			EmitEvent("CommandPaletteClosed", window)
+		end
+		function palette:Refresh()
+			for _, connection in ipairs(resultConnections) do pcall(function() connection:Disconnect() end) end
+			table.clear(resultConnections)
+			for _, child in ipairs(resultsFrame:GetChildren()) do
+				if child:IsA("GuiObject") then child:Destroy() end
+			end
+			local results = window:Search(input.Text, 12)
+			for index, entry in ipairs(results) do
+				local button = Instance.new("TextButton")
+				button.Name = tostring(entry.Name)
+				button.AutoButtonColor = false
+				button.BackgroundColor3 = Color3.fromRGB(37, 35, 44)
+				button.BackgroundTransparency = 0.2
+				button.BorderSizePixel = 0
+				button.Text = ""
+				button.Size = UDim2.new(1, -2, 0, 48)
+				button.LayoutOrder = index
+				button.ZIndex = 854
+				button.Parent = resultsFrame
+				CreateCorner(button, 7)
+				local name = CreateText(button, entry.Name, 13, true)
+				name.Position = UDim2.fromOffset(12, 4)
+				name.Size = UDim2.new(1, -24, 0, 21)
+				name.ZIndex = 855
+				local description = CreateText(button, entry.Description or entry.Category or "", 11, false)
+				description.Position = UDim2.fromOffset(12, 24)
+				description.Size = UDim2.new(1, -24, 0, 17)
+				description.TextColor3 = ProductivityColors.Muted
+				description.ZIndex = 855
+				table.insert(resultConnections, button.MouseButton1Click:Connect(function()
+					palette:Close()
+					if type(entry.Action) == "function" then SafeCall(entry.Action, entry) end
+				end))
+			end
+		end
+		palette.Input = input
+		table.insert(connections, input:GetPropertyChangedSignal("Text"):Connect(function() palette:Refresh() end))
+		table.insert(connections, background.MouseButton1Click:Connect(function() palette:Close() end))
+		table.insert(connections, UserInputService.InputBegan:Connect(function(key)
+			if palette.Closed then return end
+			if key.KeyCode == Enum.KeyCode.Escape then palette:Close() end
+		end))
+		self._Palette = palette
+		palette:Refresh()
+		task.defer(function() if input.Parent then input:CaptureFocus() end end)
+		EmitEvent("CommandPaletteOpened", self, palette)
+		return palette
+	end
+
+	function window:CloseCommandPalette()
+		if self._Palette then self._Palette:Close() end
+		return true
+	end
+
+	function window:SetUIScale(scale)
+		scale = math.clamp(tonumber(scale) or 1, 0.65, 1.5)
+		Luna.UIScale = scale
+		local root = Main.Parent or Main
+		local uiScale = root:FindFirstChild("LunaUIScale")
+		if not uiScale then
+			uiScale = Instance.new("UIScale")
+			uiScale.Name = "LunaUIScale"
+			uiScale.Parent = root
+		end
+		uiScale.Scale = scale
+		EmitEvent("UIScaleChanged", self, scale)
+		return scale
+	end
+
+	function window:SetDensity(mode)
+		mode = tostring(mode or "Comfortable")
+		local normalized = mode:lower()
+		local padding = normalized == "compact" and 3 or normalized == "spacious" and 10 or 6
+		for _, descendant in ipairs(Elements:GetDescendants()) do
+			if descendant:IsA("UIListLayout") and descendant.FillDirection == Enum.FillDirection.Vertical then
+				if descendant:GetAttribute("LunaOriginalPadding") == nil then
+					descendant:SetAttribute("LunaOriginalPadding", descendant.Padding.Offset)
+				end
+				descendant.Padding = UDim.new(0, padding)
+			end
+		end
+		self.Density = normalized == "compact" and "Compact" or normalized == "spacious" and "Spacious" or "Comfortable"
+		Luna.CurrentDensity = self.Density
+		EmitEvent("DensityChanged", self, self.Density)
+		return self.Density
+	end
+
+	function window:ResetTab(name, silent)
+		name = tostring(name or self.CurrentTab or "")
+		local count = 0
+		for _, option in pairs(Luna.Options) do
+			if option._Window == self and tostring(option._TabName or "") == name and type(option.Reset) == "function" then
+				option:Reset(silent == true)
+				count += 1
+			end
+		end
+		NormalizeAllToggleGroups(false)
+		EmitEvent("TabReset", self, name, count)
+		return true, count
+	end
+
+	window:SetUIScale(Luna.UIScale)
+	if Luna.CurrentDensity then window:SetDensity(Luna.CurrentDensity) end
+	TrackConnection(UserInputService.InputBegan:Connect(function(input, processed)
+		if processed or Luna._Destroyed or UserInputService:GetFocusedTextBox() then return end
+		if input.KeyCode ~= window.CommandPaletteKeybind then return end
+		local modifier = window.CommandPaletteModifier
+		if modifier and not UserInputService:IsKeyDown(modifier) then
+			local alternate = modifier == Enum.KeyCode.LeftControl and Enum.KeyCode.RightControl or nil
+			if not alternate or not UserInputService:IsKeyDown(alternate) then return end
+		end
+		window:OpenCommandPalette()
+	end))
+	return window
+end
+
+
+local function CountTableEntries(value)
+	local count = 0
+	for _ in pairs(type(value) == "table" and value or {}) do count += 1 end
+	return count
+end
+
+function Luna:SetFont(font)
+	if typeof(font) ~= "EnumItem" or font.EnumType ~= Enum.Font then
+		return false, "Font must be an Enum.Font value."
+	end
+	for _, descendant in ipairs(LunaUI:GetDescendants()) do
+		if descendant:IsA("TextLabel") or descendant:IsA("TextButton") or descendant:IsA("TextBox") then
+			descendant.Font = font
+		end
+	end
+	Luna.CurrentFont = font
+	EmitEvent("FontChanged", font)
+	return true, font
+end
+
+function Luna:SetComponentTransparency(value)
+	value = math.clamp(tonumber(value) or 0.5, 0, 1)
+	for _, descendant in ipairs(LunaUI:GetDescendants()) do
+		if descendant:IsA("Frame") and descendant:GetAttribute("LunaProductivityCard") then
+			descendant.BackgroundTransparency = value
+		end
+	end
+	Luna.ComponentTransparency = value
+	EmitEvent("ComponentTransparencyChanged", value)
+	return value
+end
+
+function Luna:RegisterTheme(name, theme)
+	name = tostring(name or ""):match("^%s*(.-)%s*$")
+	if name == "" then return false, "Theme name is empty." end
+	if type(theme) ~= "table" then return false, "Theme must be a table." end
+	Luna._Themes[name] = DeepCopy(theme)
+	EmitEvent("ThemeRegistered", name, Luna._Themes[name])
+	return true, name
+end
+
+function Luna:RemoveTheme(name)
+	name = tostring(name or "")
+	if not Luna._Themes[name] then return false, "Theme does not exist." end
+	Luna._Themes[name] = nil
+	EmitEvent("ThemeRemoved", name)
+	return true
+end
+
+function Luna:GetThemes()
+	return DeepCopy(Luna._Themes)
+end
+
+function Luna:SetAnimationSpeed(value)
+	Luna.AnimationSpeed = math.clamp(tonumber(value) or 1, 0, 5)
+	EmitEvent("AnimationSpeedChanged", Luna.AnimationSpeed)
+	return Luna.AnimationSpeed
+end
+
+function Luna:SetReducedMotion(enabled)
+	Luna.ReducedMotion = enabled == true
+	EmitEvent("ReducedMotionChanged", Luna.ReducedMotion)
+	return Luna.ReducedMotion
+end
+
 function Luna:SetTheme(theme)
+	local themeName
+	if type(theme) == "string" then
+		themeName = theme
+		theme = Luna._Themes[theme]
+		if not theme then return false, "Theme does not exist." end
+	end
 	theme = type(theme) == "table" and theme or {}
 	local color1 = theme.Color1 or theme[1]
 	local color2 = theme.Color2 or theme[2]
@@ -2873,9 +4846,42 @@ function Luna:SetTheme(theme)
 		ColorSequenceKeypoint.new(0.50, color2),
 		ColorSequenceKeypoint.new(1.00, color3),
 	})
+	if theme.AnimationSpeed ~= nil then Luna:SetAnimationSpeed(theme.AnimationSpeed) end
+	if theme.ReducedMotion ~= nil then Luna:SetReducedMotion(theme.ReducedMotion) end
+	if theme.Font ~= nil then Luna:SetFont(theme.Font) end
+	if theme.Transparency ~= nil then Luna:SetComponentTransparency(theme.Transparency) end
+	if theme.UIScale ~= nil then
+		Luna.UIScale = math.clamp(tonumber(theme.UIScale) or 1, 0.65, 1.5)
+		for window in pairs(Luna._Windows) do
+			if type(window.SetUIScale) == "function" then window:SetUIScale(Luna.UIScale) end
+		end
+	end
+	if theme.Density ~= nil then
+		Luna.CurrentDensity = tostring(theme.Density)
+		for window in pairs(Luna._Windows) do
+			if type(window.SetDensity) == "function" then window:SetDensity(theme.Density) end
+		end
+	end
 	LunaUI.ThemeRemote.Value = not LunaUI.ThemeRemote.Value
-	return true
+	EmitEvent("ThemeChanged", themeName, DeepCopy(theme))
+	return true, themeName or "Custom"
 end
+
+Luna:RegisterTheme("Nightlight Neo", {
+	Color1 = Color3.fromRGB(117, 164, 206),
+	Color2 = Color3.fromRGB(123, 201, 201),
+	Color3 = Color3.fromRGB(224, 138, 175),
+})
+Luna:RegisterTheme("Starlight", {
+	Color1 = Color3.fromRGB(147, 255, 239),
+	Color2 = Color3.fromRGB(181, 206, 241),
+	Color3 = Color3.fromRGB(214, 158, 243),
+})
+Luna:RegisterTheme("Solar", {
+	Color1 = Color3.fromRGB(242, 157, 76),
+	Color2 = Color3.fromRGB(240, 179, 81),
+	Color3 = Color3.fromRGB(238, 201, 86),
+})
 
 local LegacyKeyGate = Main:FindFirstChild("KeySystem")
 if LegacyKeyGate then
@@ -3002,12 +5008,18 @@ local function CloseNotificationRecord(record, immediate)
 	if not record or record.Closed then return end
 	record.Closed = true
 	RemoveNotificationRecord(record)
+	if record.Id and Luna._NotificationById[record.Id] == record.Handle then
+		Luna._NotificationById[record.Id] = nil
+	end
+	if record.Handle then record.Handle.Closed = true end
+	EmitEvent("NotificationClosed", record.Handle, immediate == true)
 
 	local notification = record.Object
 	if record.CleanupBlur then
 		pcall(record.CleanupBlur)
 		record.CleanupBlur = nil
 	end
+	DisconnectConnections(record.Connections)
 
 	if not notification or not notification.Parent then return end
 
@@ -3078,29 +5090,160 @@ function Luna:ClearNotifications()
 	return true
 end
 
-function Luna:Notification(data) -- action e.g open messages
-	if Luna._Destroyed then return end
+function Luna:GetNotificationHistory()
+	return DeepCopy(Luna._NotificationHistory)
+end
+
+function Luna:ClearNotificationHistory()
+	table.clear(Luna._NotificationHistory)
+	EmitEvent("NotificationHistoryCleared")
+	return true
+end
+
+function Luna:GetNotification(id)
+	return Luna._NotificationById[tostring(id or "")]
+end
+
+function Luna:SetMaxNotificationHistory(value)
+	Luna.MaxNotificationHistory = math.max(1, math.floor(tonumber(value) or 50))
+	while #Luna._NotificationHistory > Luna.MaxNotificationHistory do
+		table.remove(Luna._NotificationHistory, 1)
+	end
+	return Luna.MaxNotificationHistory
+end
+
+function Luna:UpdateNotification(id, data)
+	local notification = self:GetNotification(id)
+	if not notification then return false, "Notification does not exist." end
+	notification:Update(data)
+	return true, notification
+end
+
+function Luna:Notification(data) -- rich notification with actions, progress and update handles
+	if Luna._Destroyed then return nil end
+	data = Kwargify({
+		Id = nil,
+		GroupKey = nil,
+		Title = "Missing Title",
+		Content = "Missing or Unknown Content",
+		Icon = "view_in_ar",
+		ImageSource = "Material",
+		Duration = nil,
+		Persistent = false,
+		PauseOnHover = true,
+		SwipeToDismiss = true,
+		Progress = nil,
+		Actions = nil,
+		Blur = Luna.NotificationBlurEnabled,
+	}, ShallowCopy(data or {}))
+
+	local notificationId = data.Id and tostring(data.Id) or nil
+	local groupKey = data.GroupKey and tostring(data.GroupKey) or nil
+	if notificationId and Luna._NotificationById[notificationId] then
+		local existing = Luna._NotificationById[notificationId]
+		existing:Update(data)
+		return existing
+	end
+	if groupKey then
+		for _, existing in pairs(Luna._NotificationById) do
+			if existing and not existing.Closed and existing.GroupKey == groupKey then
+				existing:Update(data)
+				return existing
+			end
+		end
+	end
+
 	Luna._Stats.NotificationsCreated += 1
+	local handle = {
+		Id = notificationId,
+		GroupKey = groupKey,
+		Closed = false,
+		Ready = false,
+		Data = data,
+		_Record = nil,
+	}
+
+	local historyItem = {
+		Id = notificationId,
+		GroupKey = groupKey,
+		Title = tostring(data.Title),
+		Content = tostring(data.Content),
+		CreatedAt = os.time(),
+		Progress = tonumber(data.Progress),
+		Persistent = data.Persistent == true,
+	}
+	table.insert(Luna._NotificationHistory, historyItem)
+	while #Luna._NotificationHistory > math.max(1, tonumber(Luna.MaxNotificationHistory) or 50) do
+		table.remove(Luna._NotificationHistory, 1)
+	end
+
+	function handle:Close(immediate)
+		if self.Closed then return false end
+		self.Closed = true
+		if self.Id and Luna._NotificationById[self.Id] == self then Luna._NotificationById[self.Id] = nil end
+		if self._Record then CloseNotificationRecord(self._Record, immediate == true) end
+		return true
+	end
+
+	function handle:SetTitle(value)
+		self.Data.Title = tostring(value or "")
+		if self._Record and self._Record.Object and self._Record.Object.Parent then
+			self._Record.Object.Title.Text = self.Data.Title
+		end
+		return self
+	end
+
+	function handle:SetContent(value)
+		self.Data.Content = tostring(value or "")
+		if self._Record and self._Record.Object and self._Record.Object.Parent then
+			self._Record.Object.Description.Text = self.Data.Content
+		end
+		return self
+	end
+
+	function handle:SetProgress(value)
+		if value == nil then
+			self.Data.Progress = nil
+		else
+			value = tonumber(value) or 0
+			if value > 1 then value = value / 100 end
+			self.Data.Progress = math.clamp(value, 0, 1)
+		end
+		local record = self._Record
+		if record and record.ProgressTrack and record.ProgressTrack.Parent then
+			record.ProgressTrack.Visible = self.Data.Progress ~= nil
+			record.ProgressFill.Size = UDim2.fromScale(self.Data.Progress or 0, 1)
+		end
+		return self
+	end
+
+	function handle:Update(nextData)
+		if self.Closed then return self end
+		nextData = type(nextData) == "table" and nextData or {}
+		for key, value in pairs(nextData) do self.Data[key] = value end
+		if nextData.Title ~= nil then self:SetTitle(nextData.Title) end
+		if nextData.Content ~= nil then self:SetContent(nextData.Content) end
+		if nextData.Progress ~= nil then self:SetProgress(nextData.Progress) end
+		local record = self._Record
+		if record and record.Object and record.Object.Parent then
+			if nextData.Icon ~= nil or nextData.ImageSource ~= nil then
+				ApplyIcon(record.Object.Icon, self.Data.Icon, self.Data.ImageSource)
+			end
+		end
+		EmitEvent("NotificationUpdated", self, nextData)
+		return self
+	end
+
+	if notificationId then Luna._NotificationById[notificationId] = handle end
+	if groupKey and not notificationId then
+		local generatedId = "group:" .. groupKey
+		handle.Id = generatedId
+		Luna._NotificationById[generatedId] = handle
+	end
 
 	task.spawn(function()
-		if Luna._Destroyed then return end
-
-		data = Kwargify({
-			Title = "Missing Title",
-			Content = "Missing or Unknown Content",
-			Icon = "view_in_ar",
-			ImageSource = "Material",
-			Duration = nil,
-			Blur = Luna.NotificationBlurEnabled,
-		}, data or {})
-
-		local maximum = math.max(
-			1,
-			math.floor(tonumber(data.MaxNotifications or Luna.MaxNotifications) or 3)
-		)
-
-		-- Keep only the newest notifications. Overflow notifications are removed
-		-- immediately so no more than the configured amount is visible.
+		if Luna._Destroyed or handle.Closed then return end
+		local maximum = math.max(1, math.floor(tonumber(data.MaxNotifications or Luna.MaxNotifications) or 3))
 		while #Luna._NotificationQueue >= maximum do
 			CloseNotificationRecord(Luna._NotificationQueue[1], true)
 		end
@@ -3112,24 +5255,25 @@ function Luna:Notification(data) -- action e.g open messages
 		newNotification.Visible = false
 
 		local record = {
+			Id = handle.Id,
+			Handle = handle,
+			Connections = {},
 			Object = newNotification,
 			Closed = false,
 			CleanupBlur = data.Blur == true and BlurModule(newNotification) or nil,
 		}
+		handle._Record = record
+		handle.Ready = true
 		table.insert(Luna._NotificationQueue, record)
 		Luna._Stats.ActiveNotifications = #Luna._NotificationQueue
 
 		local function isAlive()
-			return not record.Closed
-				and not Luna._Destroyed
-				and newNotification
-				and newNotification.Parent ~= nil
+			return not record.Closed and not handle.Closed and not Luna._Destroyed and newNotification and newNotification.Parent ~= nil
 		end
 
 		newNotification.Title.Text = tostring(data.Title)
 		newNotification.Description.Text = tostring(data.Content)
 		ApplyIcon(newNotification.Icon, data.Icon, data.ImageSource)
-
 		newNotification.BackgroundTransparency = 1
 		newNotification.Title.TextTransparency = 1
 		newNotification.Description.TextTransparency = 1
@@ -3137,67 +5281,135 @@ function Luna:Notification(data) -- action e.g open messages
 		newNotification.Shadow.ImageTransparency = 1
 		newNotification.Icon.ImageTransparency = 1
 		newNotification.Icon.BackgroundTransparency = 1
+		newNotification.Active = true
+
+		local extraHeight = 0
+		local progressTrack
+		local progressFill
+		if data.Progress ~= nil then
+			progressTrack = Instance.new("Frame")
+			progressTrack.Name = "ProgressTrack"
+			progressTrack.BackgroundColor3 = Color3.fromRGB(25, 24, 30)
+			progressTrack.BackgroundTransparency = 0.1
+			progressTrack.BorderSizePixel = 0
+			progressTrack.AnchorPoint = Vector2.new(0, 1)
+			progressTrack.Position = UDim2.new(0, 16, 1, -10)
+			progressTrack.Size = UDim2.new(1, -32, 0, 5)
+			progressTrack.ZIndex = newNotification.ZIndex + 2
+			progressTrack.Parent = newNotification
+			CreateCorner(progressTrack, 3)
+			progressFill = Instance.new("Frame")
+			progressFill.Name = "Fill"
+			progressFill.BackgroundColor3 = Color3.fromRGB(130, 175, 215)
+			progressFill.BorderSizePixel = 0
+			progressFill.Size = UDim2.fromScale(0, 1)
+			progressFill.ZIndex = progressTrack.ZIndex + 1
+			progressFill.Parent = progressTrack
+			CreateCorner(progressFill, 3)
+			local gradient = Instance.new("UIGradient")
+			gradient.Color = Luna.ThemeGradient
+			gradient.Parent = progressFill
+			record.ProgressTrack = progressTrack
+			record.ProgressFill = progressFill
+			extraHeight += 14
+			handle:SetProgress(data.Progress)
+		end
+
+		local actionFrame
+		if type(data.Actions) == "table" and #data.Actions > 0 then
+			actionFrame = Instance.new("Frame")
+			actionFrame.Name = "Actions"
+			actionFrame.BackgroundTransparency = 1
+			actionFrame.AnchorPoint = Vector2.new(0, 1)
+			actionFrame.Position = UDim2.new(0, 16, 1, -(progressTrack and 22 or 10))
+			actionFrame.Size = UDim2.new(1, -32, 0, 30)
+			actionFrame.ZIndex = newNotification.ZIndex + 2
+			actionFrame.Parent = newNotification
+			local actionLayout = Instance.new("UIListLayout")
+			actionLayout.FillDirection = Enum.FillDirection.Horizontal
+			actionLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+			actionLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+			actionLayout.Padding = UDim.new(0, 6)
+			actionLayout.Parent = actionFrame
+			for index, action in ipairs(data.Actions) do
+				action = type(action) == "table" and action or {Text = tostring(action)}
+				local button = Instance.new("TextButton")
+				button.Name = tostring(action.Id or action.Text or index)
+				button.AutoButtonColor = false
+				button.BackgroundColor3 = action.Primary and Color3.fromRGB(74, 100, 136) or Color3.fromRGB(45, 43, 53)
+				button.BackgroundTransparency = 0.12
+				button.BorderSizePixel = 0
+				button.Font = Enum.Font.GothamSemibold
+				button.Text = tostring(action.Text or "Action")
+				button.TextColor3 = ProductivityColors.Text
+				button.TextSize = 10
+				button.Size = UDim2.fromOffset(math.max(64, #button.Text * 7 + 20), 28)
+				button.ZIndex = actionFrame.ZIndex + 1
+				button.Parent = actionFrame
+				CreateCorner(button, 6)
+				TrackConnection(button.MouseButton1Click:Connect(function()
+					if type(action.Callback) == "function" then SafeCall(action.Callback, handle, action) end
+					EmitEvent("NotificationAction", handle, action)
+					if action.Close ~= false then handle:Close(false) end
+				end), record.Connections)
+			end
+			extraHeight += 36
+		end
 
 		task.wait()
 		if not isAlive() then return end
-
 		local layout = Notifications:FindFirstChild("UIListLayout")
 		local padding = layout and layout.Padding.Offset or 0
-
 		newNotification.Size = UDim2.new(1, 0, 0, -padding)
 		newNotification.Icon.Size = UDim2.new(0, 28, 0, 28)
-		newNotification.Icon.Position = UDim2.new(0, 16, 0.5, -1)
+		newNotification.Icon.Position = UDim2.new(0, 16, 0, 28)
 		newNotification.Visible = true
-
 		newNotification.Description.Size = UDim2.new(1, -65, 0, math.huge)
-		local bounds = newNotification.Description.TextBounds.Y + 55
-		newNotification.Description.Size = UDim2.new(1, -65, 0, bounds - 35)
+		local bounds = newNotification.Description.TextBounds.Y + 55 + extraHeight
+		newNotification.Description.Size = UDim2.new(1, -65, 0, math.max(20, bounds - 35 - extraHeight))
 		newNotification.Size = UDim2.new(1, 0, 0, -padding)
 
-		TweenService:Create(
-			newNotification,
-			TweenInfo.new(0.6, Enum.EasingStyle.Exponential),
-			{Size = UDim2.new(1, 0, 0, bounds)}
-		):Play()
-
-		task.wait(0.15)
+		TweenService:Create(newNotification, ScaleTweenInfo(TweenInfo.new(0.6, Enum.EasingStyle.Exponential)), {
+			Size = UDim2.new(1, 0, 0, bounds),
+		}):Play()
+		task.wait(Luna.ReducedMotion and 0 or 0.15)
 		if not isAlive() then return end
+		TweenService:Create(newNotification, ScaleTweenInfo(TweenInfo.new(0.4, Enum.EasingStyle.Exponential)), {BackgroundTransparency = 0.45}):Play()
+		TweenService:Create(newNotification.Title, ScaleTweenInfo(TweenInfo.new(0.3, Enum.EasingStyle.Exponential)), {TextTransparency = 0}):Play()
+		TweenService:Create(newNotification.Icon, ScaleTweenInfo(TweenInfo.new(0.3, Enum.EasingStyle.Exponential)), {ImageTransparency = 0}):Play()
+		TweenService:Create(newNotification.Description, ScaleTweenInfo(TweenInfo.new(0.3, Enum.EasingStyle.Exponential)), {TextTransparency = 0.35}):Play()
+		TweenService:Create(newNotification.UIStroke, ScaleTweenInfo(TweenInfo.new(0.4, Enum.EasingStyle.Exponential)), {Transparency = 0.95}):Play()
+		TweenService:Create(newNotification.Shadow, ScaleTweenInfo(TweenInfo.new(0.3, Enum.EasingStyle.Exponential)), {ImageTransparency = 0.82}):Play()
 
-		TweenService:Create(newNotification, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {
-			BackgroundTransparency = 0.45,
-		}):Play()
-		TweenService:Create(newNotification.Title, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {
-			TextTransparency = 0,
-		}):Play()
+		local hovered = false
+		TrackConnection(newNotification.MouseEnter:Connect(function() hovered = true end), record.Connections)
+		TrackConnection(newNotification.MouseLeave:Connect(function() hovered = false end), record.Connections)
 
-		task.wait(0.05)
-		if not isAlive() then return end
-		TweenService:Create(newNotification.Icon, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {
-			ImageTransparency = 0,
-		}):Play()
+		if data.SwipeToDismiss ~= false then
+			local touchStart
+			TrackConnection(newNotification.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.Touch then touchStart = input.Position end
+			end), record.Connections)
+			TrackConnection(newNotification.InputEnded:Connect(function(input)
+				if touchStart and input.UserInputType == Enum.UserInputType.Touch then
+					if math.abs(input.Position.X - touchStart.X) >= 80 then handle:Close(false) end
+					touchStart = nil
+				end
+			end), record.Connections)
+		end
 
-		task.wait(0.05)
-		if not isAlive() then return end
-
-		TweenService:Create(newNotification.Description, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {
-			TextTransparency = 0.35,
-		}):Play()
-		TweenService:Create(newNotification.UIStroke, TweenInfo.new(0.4, Enum.EasingStyle.Exponential), {
-			Transparency = 0.95,
-		}):Play()
-		TweenService:Create(newNotification.Shadow, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {
-			ImageTransparency = 0.82,
-		}):Play()
-
-		local waitDuration = math.min(
-			math.max((#newNotification.Description.Text * 0.1) + 2.5, 3),
-			10
-		)
-		task.wait(math.max(0.1, tonumber(data.Duration) or waitDuration))
-
-		if not isAlive() then return end
-		CloseNotificationRecord(record, false)
+		EmitEvent("NotificationCreated", handle, data)
+		if data.Persistent == true then return end
+		local waitDuration = math.min(math.max((#newNotification.Description.Text * 0.1) + 2.5, 3), 10)
+		local remaining = math.max(0.1, tonumber(data.Duration) or waitDuration)
+		while remaining > 0 and isAlive() do
+			local step = math.min(0.1, remaining)
+			task.wait(step)
+			if not (data.PauseOnHover ~= false and hovered) then remaining -= step end
+		end
+		if isAlive() then handle:Close(false) end
 	end)
+	return handle
 end
 
 local function Unhide(Window, currentTab)
@@ -3524,7 +5736,7 @@ function Luna:CreateWindow(WindowSettings)
 		task.wait(0.05)
 		TweenService:Create(LoadingFrame.Frame.Frame.Subtitle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
 		TweenService:Create(LoadingFrame.Version, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 1}):Play()
-		wait(0.3)
+		task.wait(0.3)
 		TweenService:Create(LoadingFrame, TweenInfo.new(0.5, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 1}):Play()
 	end
 
@@ -3536,7 +5748,7 @@ function Luna:CreateWindow(WindowSettings)
 	TweenService:Create(Navigation.Player.icon.ImageLabel, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0}):Play()
 	TweenService:Create(Navigation.Player.icon.UIStroke, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Transparency = 0}):Play()
 	TweenService:Create(Main.Line, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
-	wait(0.4)
+	task.wait(0.4)
 	LoadingFrame.Visible = false
 
 	Draggable(Dragger, Main)
@@ -4259,6 +6471,7 @@ function Luna:CreateWindow(WindowSettings)
 			end
 
 			Window.CurrentTab = TabSettings.Name
+			EmitEvent("TabChanged", Window, TabSettings.Name, Tab)
 		end
 
 		if FirstTab then
@@ -4274,13 +6487,14 @@ function Luna:CreateWindow(WindowSettings)
 		FirstTab = false
 
 		-- Section
-		function Tab:CreateSection(name : string)
+		function Tab:CreateSection(name)
 
 			local Section = {}
-
-			if name == nil then name = "Section" end
+			local SectionSettings = type(name) == "table" and ShallowCopy(name) or {Name = name}
+			name = tostring(SectionSettings.Name or "Section")
 
 			Section.Name = name
+			Section.Settings = SectionSettings
 			Section.Collapsed = false
 
 			local Sectiont = Elements.Template.Section:Clone()
@@ -4293,8 +6507,14 @@ function Luna:CreateWindow(WindowSettings)
 			tween(Sectiont, {TextTransparency = 0})
 
 			function Section:Set(NewSection)
+				if type(NewSection) == "table" then
+					for key, value in pairs(NewSection) do Section.Settings[key] = value end
+					NewSection = NewSection.Name or Section.Name
+				end
 				Section.Name = tostring(NewSection or "Section")
+				Section.Settings.Name = Section.Name
 				Sectiont.Text = Section.Name
+				return Section
 			end
 
 			function Section:SetCollapsed(collapsed)
@@ -4340,7 +6560,7 @@ function Luna:CreateWindow(WindowSettings)
 
 
 				local Button
-				if ButtonSettings.Description == nil and ButtonSettings.Description ~= "" then
+				if ButtonSettings.Description == nil or ButtonSettings.Description == "" then
 					Button = Elements.Template.Button:Clone()
 				else
 					Button = Elements.Template.ButtonDesc:Clone()
@@ -4375,14 +6595,14 @@ function Luna:CreateWindow(WindowSettings)
 						TweenService:Create(Button.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 						Button.Title.Text = "Callback Error"
 						print("Luna Interface Suite | "..ButtonSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
+						task.wait(0.5)
 						Button.Title.Text = ButtonSettings.Name
 						TweenService:Create(Button, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 						TweenService:Create(Button, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
 						TweenService:Create(Button.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
 					else
 						tween(Button.UIStroke, {Color = Color3.fromRGB(136, 131, 163)})
-						wait(0.2)
+						task.wait(0.2)
 						if ButtonV.Hover then
 							tween(Button.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 						else
@@ -5368,6 +7588,7 @@ function Luna:CreateWindow(WindowSettings)
 				TabPage.Position = UDim2.new(0,0,0,28)
 				local DropdownV = { IgnoreConfig = false, Class = "Dropdown", Settings = DropdownSettings}
 				local PlayerConnections = {}
+				local OptionConnections = {}
 
 				DropdownSettings = Kwargify({
 					Name = "Dropdown",
@@ -5453,7 +7674,7 @@ function Luna:CreateWindow(WindowSettings)
 						TweenService:Create(Dropdown.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 						Dropdown.Title.Text = "Callback Error"
 						print("Luna Interface Suite | "..DropdownSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
+						task.wait(0.5)
 						Dropdown.Title.Text = DropdownSettings.Name
 						TweenService:Create(Dropdown, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 						TweenService:Create(Dropdown, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
@@ -5476,6 +7697,7 @@ function Luna:CreateWindow(WindowSettings)
 
 
 				local function Clear()
+					DisconnectConnections(OptionConnections)
 					for _, option in ipairs(Dropdown.List:GetChildren()) do
 						if option.ClassName == "TextLabel" and option.Name ~= "Template" then
 							option:Destroy()
@@ -5502,7 +7724,7 @@ function Luna:CreateWindow(WindowSettings)
 						Option.Text = v
 						if v == "Template" then v = "Template (Name)" end
 						Option.Name = v
-						Option.Interact.MouseButton1Click:Connect(function()
+						TrackConnection(Option.Interact.MouseButton1Click:Connect(function()
 							local bleh
 							if DropdownSettings.MultipleOptions then
 								if table.find(DropdownSettings.CurrentOption, v) then
@@ -5545,25 +7767,25 @@ function Luna:CreateWindow(WindowSettings)
 								end
 								Dropdown.Selected.Text = ""
 							end)
-						end)
+						end), OptionConnections)
 						Option.Visible = true
 						Option.Parent = Dropdown.List
-						Option.MouseEnter:Connect(function()
+						TrackConnection(Option.MouseEnter:Connect(function()
 							optionhover = true
 							if Option.BackgroundTransparency == 0.95 then
 								return
 							else
 								tween(Option, {TextColor3 = Color3.fromRGB(240,240,240)})
 							end
-						end)
-						Option.MouseLeave:Connect(function()
+						end), OptionConnections)
+						TrackConnection(Option.MouseLeave:Connect(function()
 							optionhover = false
 							if Option.BackgroundTransparency == 0.95 then
 								return
 							else
 								tween(Option, {TextColor3 = Color3.fromRGB(200,200,200)})
 							end
-						end)	
+						end), OptionConnections)	
 					end
 				end
 
@@ -5740,6 +7962,7 @@ function Luna:CreateWindow(WindowSettings)
 
 				function DropdownV:Destroy()
 					DisconnectConnections(PlayerConnections)
+					DisconnectConnections(OptionConnections)
 					RemoveOption(DropdownV)
 					Dropdown.Visible = false
 					Dropdown:Destroy()
@@ -5956,6 +8179,18 @@ function Luna:CreateWindow(WindowSettings)
 				return ColorPickerV
 			end
 
+			Section._Header = Sectiont
+			Section._Body = TabPage
+			Section._Object = Sectiont
+			EnhanceComponent(Section)
+			Section._Window = Window
+			Section._Tab = Tab
+			EnhanceContainerAPI(Section, TabPage, Window, Tab, {
+				Name = Section.Name,
+				Header = Sectiont,
+				IsSection = true,
+			})
+			EnhanceCollapsibleSection(Section, SectionSettings)
 			return Section
 
 		end
@@ -5986,7 +8221,7 @@ function Luna:CreateWindow(WindowSettings)
 
 
 			local Button
-			if ButtonSettings.Description == nil and ButtonSettings.Description ~= "" then
+			if ButtonSettings.Description == nil or ButtonSettings.Description == "" then
 				Button = Elements.Template.Button:Clone()
 			else
 				Button = Elements.Template.ButtonDesc:Clone()
@@ -6021,14 +8256,14 @@ function Luna:CreateWindow(WindowSettings)
 					TweenService:Create(Button.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 					Button.Title.Text = "Callback Error"
 					print("Luna Interface Suite | "..ButtonSettings.Name.." Callback Error " ..tostring(Response))
-					wait(0.5)
+					task.wait(0.5)
 					Button.Title.Text = ButtonSettings.Name
 					TweenService:Create(Button, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 					TweenService:Create(Button, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
 					TweenService:Create(Button.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
 				else
 					tween(Button.UIStroke, {Color = Color3.fromRGB(136, 131, 163)})
-					wait(0.2)
+					task.wait(0.2)
 					if ButtonV.Hover then
 						tween(Button.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 					else
@@ -7015,6 +9250,7 @@ function Luna:CreateWindow(WindowSettings)
 		function Tab:CreateDropdown(DropdownSettings, Flag)
 			local DropdownV = { IgnoreConfig = false, Class = "Dropdown", Settings = DropdownSettings}
 			local PlayerConnections = {}
+			local OptionConnections = {}
 
 			DropdownSettings = Kwargify({
 				Name = "Dropdown",
@@ -7100,7 +9336,7 @@ function Luna:CreateWindow(WindowSettings)
 					TweenService:Create(Dropdown.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 					Dropdown.Title.Text = "Callback Error"
 					print("Luna Interface Suite | "..DropdownSettings.Name.." Callback Error " ..tostring(Response))
-					wait(0.5)
+					task.wait(0.5)
 					Dropdown.Title.Text = DropdownSettings.Name
 					TweenService:Create(Dropdown, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 					TweenService:Create(Dropdown, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
@@ -7123,6 +9359,7 @@ function Luna:CreateWindow(WindowSettings)
 
 
 			local function Clear()
+				DisconnectConnections(OptionConnections)
 				for _, option in ipairs(Dropdown.List:GetChildren()) do
 					if option.ClassName == "TextLabel" and option.Name ~= "Template" then
 						option:Destroy()
@@ -7149,7 +9386,7 @@ function Luna:CreateWindow(WindowSettings)
 					Option.Text = v
 					if v == "Template" then v = "Template (Name)" end
 					Option.Name = v
-					Option.Interact.MouseButton1Click:Connect(function()
+					TrackConnection(Option.Interact.MouseButton1Click:Connect(function()
 						local bleh
 						if DropdownSettings.MultipleOptions then
 							if table.find(DropdownSettings.CurrentOption, v) then
@@ -7192,25 +9429,25 @@ function Luna:CreateWindow(WindowSettings)
 							end
 							Dropdown.Selected.Text = ""
 						end)
-					end)
+					end), OptionConnections)
 					Option.Visible = true
 					Option.Parent = Dropdown.List
-					Option.MouseEnter:Connect(function()
+					TrackConnection(Option.MouseEnter:Connect(function()
 						optionhover = true
 						if Option.BackgroundTransparency == 0.95 then
 							return
 						else
 							tween(Option, {TextColor3 = Color3.fromRGB(240,240,240)})
 						end
-					end)
-					Option.MouseLeave:Connect(function()
+					end), OptionConnections)
+					TrackConnection(Option.MouseLeave:Connect(function()
 						optionhover = false
 						if Option.BackgroundTransparency == 0.95 then
 							return
 						else
 							tween(Option, {TextColor3 = Color3.fromRGB(200,200,200)})
 						end
-					end)	
+					end), OptionConnections)	
 				end
 			end
 
@@ -7385,6 +9622,7 @@ function Luna:CreateWindow(WindowSettings)
 
 			function DropdownV:Destroy()
 				DisconnectConnections(PlayerConnections)
+				DisconnectConnections(OptionConnections)
 				RemoveOption(DropdownV)
 				Dropdown.Visible = false
 				Dropdown:Destroy()
@@ -8230,13 +10468,18 @@ function Luna:CreateWindow(WindowSettings)
 
 			local writeSuccess, writeError =
 				WriteVerifiedFile(fullPath, encoded)
-			if not writeSuccess then return false, writeError end
+			if not writeSuccess then
+				EmitEvent("ConfigFailed", "Save", safeName, writeError)
+				return false, writeError
+			end
 
+			EmitEvent("ConfigSaved", safeName, data)
 			return true, safeName
 		end
 
 		function Luna:LoadConfig(path, loadOptions)
 			loadOptions = type(loadOptions) == "table" and loadOptions or {}
+			EmitEvent("ConfigLoading", path, loadOptions)
 			local strict = loadOptions.Strict
 			if strict == nil then strict = Luna.StrictConfig == true end
 			local fireCallbacks = loadOptions.FireCallbacks ~= false
@@ -8354,6 +10597,7 @@ function Luna:CreateWindow(WindowSettings)
 			end
 
 			Luna._Stats.ConfigWarnings += #warnings
+			EmitEvent("ConfigLoaded", safeName, warnings)
 			return true, safeName, warnings
 		end
 
@@ -8617,6 +10861,18 @@ function Luna:CreateWindow(WindowSettings)
 		end
 
 
+		Tab._Page = TabPage
+		Tab._Button = TabButton
+		Tab._Object = TabPage
+		EnhanceComponent(Tab)
+		Tab._Window = Window
+		Tab._Name = TabSettings.Name
+		EnhanceContainerAPI(Tab, TabPage, Window, Tab, {
+			Name = TabSettings.Name,
+			Button = TabButton,
+			IsTab = true,
+		})
+		if type(Window._RegisterTab) == "function" then Window:_RegisterTab(Tab) end
 		return Tab
 	end
 
@@ -8655,6 +10911,7 @@ function Luna:CreateWindow(WindowSettings)
 		if UserInputService.KeyboardEnabled == false then
 			LunaUI.MobileSupport.Visible = true
 		end
+		EmitEvent("WindowHidden", Window)
 		return true
 	end
 
@@ -8667,6 +10924,7 @@ function Luna:CreateWindow(WindowSettings)
 		LunaUI.MobileSupport.Visible = false
 		dragBar.Visible = true
 		Unhide(Main, Window.CurrentTab)
+		EmitEvent("WindowOpened", Window)
 		return true
 	end
 
@@ -8818,12 +11076,16 @@ function Luna:CreateWindow(WindowSettings)
 	function Window:Destroy() CloseWindow() end
 	function Window:DestroyLibrary() Luna:Destroy() end
 	function Window:GetDiagnostics() return Luna:GetDiagnostics() end
+	EnhanceWindowProductivity(Window, WindowSettings)
+	Luna._Windows[Window] = true
+	EmitEvent("WindowCreated", Window)
 	return Window
 end
 
 function Luna:Destroy()
 	if Luna._Destroyed then return end
 	Luna._Destroyed = true
+	EmitEvent("Destroyed", Luna)
 
 	while #Luna._NotificationQueue > 0 do
 		CloseNotificationRecord(Luna._NotificationQueue[1], true)
@@ -8846,6 +11108,12 @@ function Luna:Destroy()
 	table.clear(Luna._Components)
 	table.clear(Luna._ToggleGroups)
 	table.clear(Luna._MutatingToggleGroups)
+	table.clear(Luna._Events)
+	table.clear(Luna._NotificationHistory)
+	table.clear(Luna._NotificationById)
+	table.clear(Luna._Themes)
+	table.clear(Luna._Windows)
+	table.clear(ActiveTweens)
 	Luna._Stats.RenderLoops = 0
 	if rawget(GlobalEnvironment, "__LUNA_ACTIVE_LIBRARY") == Luna then
 		GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = nil
