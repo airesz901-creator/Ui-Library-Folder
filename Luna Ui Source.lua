@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.12 - ZIndex Hotfix"
+local Release = "Luna Custom 7.3.13 - Topbar Status Layout Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -5776,14 +5776,16 @@ function Luna:CreateWindow(WindowSettings)
 	StatusDisplay.Name = "LunaStatusDisplay"
 	StatusDisplay.BackgroundTransparency = 1
 	StatusDisplay.AnchorPoint = Vector2.new(1, 0.5)
-	StatusDisplay.Position = UDim2.new(1, -14, 0, 39)
-	StatusDisplay.Size = UDim2.fromOffset(210, 18)
+	StatusDisplay.Position = UDim2.fromOffset(0, 0)
+	StatusDisplay.Size = UDim2.fromOffset(150, 18)
 	StatusDisplay.Text = ""
 	StatusDisplay.TextXAlignment = Enum.TextXAlignment.Right
 	StatusDisplay.TextYAlignment = Enum.TextYAlignment.Center
 	StatusDisplay.TextTruncate = Enum.TextTruncate.AtEnd
 	StatusDisplay.TextWrapped = false
-	StatusDisplay.TextSize = math.max(10, math.min(14, tonumber(StatusDisplay.TextSize) or 12))
+	StatusDisplay.TextSize = 11
+	StatusDisplay.Active = false
+	StatusDisplay.Selectable = false
 	-- Main.Controls / Control is a Folder in the current Luna asset, so it has no ZIndex.
 	-- Read the layer only from real GuiObjects and keep a safe fallback.
 	local statusBaseZIndex = 1
@@ -5803,13 +5805,81 @@ function Luna:CreateWindow(WindowSettings)
 	local statusFrameCount = 0
 	local statusElapsed = 0
 	local statusLastClock = "--:--"
+	local statusHasRoom = true
+
+	local function GetRenderedTextRight(textObject, mainLeft)
+		if not textObject or not textObject:IsA("TextLabel") then
+			return 0
+		end
+		local relativeLeft = textObject.AbsolutePosition.X - mainLeft
+		local renderedWidth = tonumber(textObject.TextBounds.X) or 0
+		if renderedWidth <= 0 then
+			renderedWidth = math.min(textObject.AbsoluteSize.X, 120)
+		end
+		return relativeLeft + math.min(renderedWidth, textObject.AbsoluteSize.X)
+	end
+
+	local function GetTopbarControlAnchor(mainLeft, mainTop, mainWidth)
+		local leftEdge = math.huge
+		local centerY
+		for _, control in ipairs(Main.Controls:GetChildren()) do
+			if control:IsA("GuiObject")
+				and control.Name ~= "Theme"
+				and control.AbsoluteSize.X > 0
+				and control.AbsoluteSize.Y > 0
+			then
+				local relativeLeft = control.AbsolutePosition.X - mainLeft
+				-- Ignore malformed/off-window controls, but visibility is intentionally
+				-- not required because controls are hidden during the loading animation.
+				if relativeLeft >= 0 and relativeLeft <= mainWidth then
+					if relativeLeft < leftEdge then
+						leftEdge = relativeLeft
+						centerY = control.AbsolutePosition.Y - mainTop
+							+ (control.AbsoluteSize.Y * 0.5)
+					end
+				end
+			end
+		end
+
+		if leftEdge == math.huge then
+			leftEdge = mainWidth - 116
+		end
+		if not centerY then
+			local separator = Main:FindFirstChild("Line")
+			if separator and separator:IsA("GuiObject") then
+				centerY = math.max(16, (separator.AbsolutePosition.Y - mainTop) * 0.5)
+			else
+				centerY = 23
+			end
+		end
+		return leftEdge, centerY
+	end
 
 	local function RefreshStatusLayout()
 		if not StatusDisplay or not StatusDisplay.Parent then return end
 		local mainWidth = math.max(0, Main.AbsoluteSize.X)
-		local width = math.clamp(mainWidth - 250, 100, 210)
+		local mainLeft = Main.AbsolutePosition.X
+		local mainTop = Main.AbsolutePosition.Y
+		local controlLeft, controlCenterY = GetTopbarControlAnchor(mainLeft, mainTop, mainWidth)
+
+		-- Keep the status on the same horizontal line as the topbar controls and
+		-- stop it before the left-most minimize/hide/close button.
+		local rightEdge = math.clamp(controlLeft - 8, 0, math.max(0, mainWidth - 8))
+		local titleRight = 72
+		if Main:FindFirstChild("Title") then
+			titleRight = math.max(
+				titleRight,
+				GetRenderedTextRight(Main.Title:FindFirstChild("Title"), mainLeft),
+				GetRenderedTextRight(Main.Title:FindFirstChild("subtitle"), mainLeft)
+			)
+		end
+		local availableWidth = rightEdge - titleRight - 12
+		statusHasRoom = availableWidth >= 72
+		local width = math.clamp(availableWidth, 72, 190)
+
+		StatusDisplay.Position = UDim2.fromOffset(rightEdge, controlCenterY)
 		StatusDisplay.Size = UDim2.fromOffset(width, 18)
-		StatusDisplay.TextSize = mainWidth < 440 and 10 or 12
+		StatusDisplay.TextSize = mainWidth < 440 and 10 or 11
 	end
 
 	local function FormatStatusClock()
@@ -5848,6 +5918,7 @@ function Luna:CreateWindow(WindowSettings)
 		StatusDisplay.Text = table.concat(parts, tostring(statusSettings.Separator or "  •  "))
 		StatusDisplay.Visible = Window.State
 			and statusSettings.Enabled ~= false
+			and statusHasRoom
 			and #parts > 0
 	end
 
@@ -5877,6 +5948,25 @@ function Luna:CreateWindow(WindowSettings)
 		end
 	end))
 	TrackConnection(Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(RefreshStatusLayout))
+	TrackConnection(Main:GetPropertyChangedSignal("AbsolutePosition"):Connect(RefreshStatusLayout))
+	TrackConnection(Main.Title.Title:GetPropertyChangedSignal("TextBounds"):Connect(RefreshStatusLayout))
+	TrackConnection(Main.Title.subtitle:GetPropertyChangedSignal("TextBounds"):Connect(RefreshStatusLayout))
+
+	local function TrackStatusControlLayout(control)
+		if not control or not control:IsA("GuiObject") then return end
+		TrackConnection(control:GetPropertyChangedSignal("AbsolutePosition"):Connect(RefreshStatusLayout))
+		TrackConnection(control:GetPropertyChangedSignal("AbsoluteSize"):Connect(RefreshStatusLayout))
+	end
+	for _, control in ipairs(Main.Controls:GetChildren()) do
+		TrackStatusControlLayout(control)
+	end
+	TrackConnection(Main.Controls.ChildAdded:Connect(function(control)
+		TrackStatusControlLayout(control)
+		task.defer(RefreshStatusLayout)
+	end))
+	TrackConnection(Main.Controls.ChildRemoved:Connect(function()
+		task.defer(RefreshStatusLayout)
+	end))
 
 	function Window:SetStatusDisplayEnabled(enabled)
 		self.StatusDisplaySettings.Enabled = enabled ~= false
@@ -5936,6 +6026,7 @@ function Luna:CreateWindow(WindowSettings)
 	Main.Title.Title.Text = WindowSettings.Name
 	Main.Title.subtitle.Text = WindowSettings.Subtitle
 	Main.Logo.Image = "rbxassetid://" .. WindowSettings.LogoID
+	task.defer(RefreshStatusLayout)
 	Main.Visible = true
 	Main.BackgroundTransparency = 1
 	Main.Size = MainSize
