@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.5.0 - Super Ultimate Reliability"
+local Release = "Luna Custom 7.5.1 - Clean Drag Surface"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -3652,6 +3652,26 @@ local Dragger = Main.Drag
 local dragBar = LunaUI.Drag
 local dragInteract = dragBar and dragBar.Interact or nil
 local dragBarCosmetic = dragBar and dragBar.Drag or nil
+
+-- The original Luna asset includes a separate white drag handle below the
+-- window. Keep the instance for asset compatibility, but disable both its
+-- visuals and input permanently. The main topbar remains draggable.
+local function DisableExternalDragHandle()
+	if dragBar and dragBar:IsA("GuiObject") then
+		dragBar.Visible = false
+		dragBar.Active = false
+	end
+	if dragInteract and dragInteract:IsA("GuiObject") then
+		dragInteract.Active = false
+		dragInteract.Selectable = false
+	end
+	if dragBarCosmetic and dragBarCosmetic:IsA("GuiObject") then
+		dragBarCosmetic.Visible = false
+		dragBarCosmetic.BackgroundTransparency = 1
+	end
+end
+DisableExternalDragHandle()
+
 local Elements = Main.Elements.Interactions
 local LoadingFrame = Main.LoadingFrame
 local Navigation = Main.Navigation
@@ -5541,7 +5561,7 @@ local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 			FramePos.Y.Scale, FramePos.Y.Offset + delta.Y
 		))
 		Window.Position = newPosition
-		if dragBar then
+		if enableTaptic and dragBar then
 			dragBar.Position = UDim2.new(
 				newPosition.X.Scale, newPosition.X.Offset,
 				newPosition.Y.Scale, newPosition.Y.Offset + (tonumber(tapticOffset) or 240)
@@ -6617,7 +6637,7 @@ function Luna:CreateWindow(WindowSettings)
 
 	Draggable(Dragger, Main)
 	Draggable(LunaUI.MobileSupport, LunaUI.MobileSupport)
-	if dragBar then Draggable(dragInteract, Main, true, 255) end
+	-- External bottom drag handle intentionally disabled for a cleaner UI.
 
 	Elements.Template.LayoutOrder = 1000000000
 	Elements.Template.Visible = false
@@ -12270,7 +12290,7 @@ function Luna:CreateWindow(WindowSettings)
 		-- Commit logical state before touching visuals so a second input
 		-- always sees the newest state, even when keys are spammed.
 		Window.State = false
-		dragBar.Visible = false
+		DisableExternalDragHandle()
 		if StatusDisplay then StatusDisplay.Visible = false end
 
 		Hide(
@@ -12294,7 +12314,7 @@ function Luna:CreateWindow(WindowSettings)
 
 		Window.State = true
 		LunaUI.MobileSupport.Visible = false
-		dragBar.Visible = true
+		DisableExternalDragHandle()
 		Unhide(Main, Window.CurrentTab)
 		RefreshStatusDisplay()
 		EmitEvent("WindowOpened", Window)
@@ -12311,7 +12331,7 @@ function Luna:CreateWindow(WindowSettings)
 	local function CloseWindow()
 		if Luna._Destroyed then return end
 		Window.State = false
-		dragBar.Visible = false
+		DisableExternalDragHandle()
 		LunaUI.MobileSupport.Visible = false
 		Luna:Destroy()
 	end
@@ -12372,10 +12392,10 @@ function Luna:CreateWindow(WindowSettings)
 		Window.Size = not Window.Size
 		if Window.Size then
 			Minimize(Main)
-			dragBar.Visible = false
+			DisableExternalDragHandle()
 		else
 			Maximise(Main)
-			dragBar.Visible = true
+			DisableExternalDragHandle()
 		end
 	end))
 	TrackConnection(Main.Controls.ToggleSize.MouseEnter:Connect(function()
