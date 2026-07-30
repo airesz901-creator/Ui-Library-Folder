@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.5.1 - Clean Drag Surface"
+local Release = "Luna Custom 7.5.2"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -3677,6 +3677,17 @@ local LoadingFrame = Main.LoadingFrame
 local Navigation = Main.Navigation
 local Tabs = Navigation.Tabs
 local Notifications = LunaUI.Notifications
+
+-- Tabs must only change through their navigation buttons. UIPageLayout
+-- otherwise treats the mouse wheel, touch swipes and gamepad navigation as
+-- page-change input, which can unexpectedly return the user to Home.
+local TabPageLayout = Elements:FindFirstChildOfClass("UIPageLayout")
+if TabPageLayout then
+	TabPageLayout.ScrollWheelInputEnabled = false
+	TabPageLayout.TouchInputEnabled = false
+	TabPageLayout.GamepadInputEnabled = false
+	TabPageLayout.Circular = false
+end
 
 -- Luna 7.3 productivity and component extension layer.
 local ProductivityColors = {
