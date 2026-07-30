@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.5.2"
+local Release = "Luna Custom 7.5.1 - Clean Drag Surface"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -3683,10 +3683,18 @@ local Notifications = LunaUI.Notifications
 -- page-change input, which can unexpectedly return the user to Home.
 local TabPageLayout = Elements:FindFirstChildOfClass("UIPageLayout")
 if TabPageLayout then
-	TabPageLayout.ScrollWheelInputEnabled = false
-	TabPageLayout.TouchInputEnabled = false
-	TabPageLayout.GamepadInputEnabled = false
-	TabPageLayout.Circular = false
+	-- Some executor environments expose an older UIPageLayout surface.
+	-- Keep each assignment protected so one unsupported property cannot stop
+	-- the library before tab content is created.
+	pcall(function()
+		TabPageLayout.ScrollWheelInputEnabled = false
+	end)
+	pcall(function()
+		TabPageLayout.TouchInputEnabled = false
+	end)
+	pcall(function()
+		TabPageLayout.GamepadInputEnabled = false
+	end)
 end
 
 -- Luna 7.3 productivity and component extension layer.
