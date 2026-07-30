@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.0 - Productivity & Components"
+local Release = "Luna Custom 7.3.1 - Collapse Interaction Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -4214,31 +4214,92 @@ local function EnhanceCollapsibleSection(section, settings)
 	if not section or not section._Header or section._CollapsibleEnhanced then return section end
 	section._CollapsibleEnhanced = true
 	settings = type(settings) == "table" and settings or {}
+
 	local header = section._Header
-	local arrow = CreateText(header, "▾", 14, true)
+	local HEADER_HEIGHT = math.max(24, tonumber(settings.HeaderHeight) or 28)
+	local ARROW_WIDTH = math.max(26, tonumber(settings.ArrowWidth) or 32)
+
+	-- IMPORTANT: The section template contains its body inside the header object.
+	-- A full-scale transparent button therefore covers every child component and
+	-- makes ordinary button/toggle/input clicks collapse the section. Keep both
+	-- interaction targets restricted to the fixed title row only.
+	local titleButton = Instance.new("TextButton")
+	titleButton.Name = "CollapseHeaderInteract"
+	titleButton.BackgroundTransparency = 1
+	titleButton.BorderSizePixel = 0
+	titleButton.Text = ""
+	titleButton.AutoButtonColor = false
+	titleButton.Active = true
+	titleButton.Position = UDim2.fromOffset(0, 0)
+	titleButton.Size = UDim2.new(1, -ARROW_WIDTH, 0, HEADER_HEIGHT)
+	titleButton.ZIndex = header.ZIndex + 1
+	titleButton.Parent = header
+
+	local arrow = Instance.new("TextButton")
 	arrow.Name = "CollapseArrow"
-	arrow.TextXAlignment = Enum.TextXAlignment.Right
-	arrow.Position = UDim2.new(1, -28, 0, 0)
-	arrow.Size = UDim2.fromOffset(22, math.max(22, header.AbsoluteSize.Y))
+	arrow.AnchorPoint = Vector2.new(1, 0)
+	arrow.BackgroundTransparency = 1
+	arrow.BorderSizePixel = 0
+	arrow.AutoButtonColor = false
+	arrow.Active = true
+	arrow.Position = UDim2.new(1, -2, 0, 0)
+	arrow.Size = UDim2.fromOffset(ARROW_WIDTH, HEADER_HEIGHT)
+	arrow.Font = Enum.Font.GothamBold
+	arrow.Text = "▼"
+	arrow.TextColor3 = ProductivityColors.MutedText
+	arrow.TextSize = 13
+	arrow.TextXAlignment = Enum.TextXAlignment.Center
+	arrow.TextYAlignment = Enum.TextYAlignment.Center
 	arrow.ZIndex = header.ZIndex + 2
-	local button = Instance.new("TextButton")
-	button.Name = "CollapseInteract"
-	button.BackgroundTransparency = 1
-	button.Text = ""
-	button.Size = UDim2.fromScale(1, 1)
-	button.ZIndex = header.ZIndex + 1
-	button.Parent = header
+	arrow.Parent = header
+	arrow:SetAttribute("LunaCollapseControl", true)
+
+	section._CollapseHeaderButton = titleButton
+	section._CollapseArrow = arrow
 
 	local baseSetCollapsed = section.SetCollapsed
 	function section:SetCollapsed(collapsed)
-		baseSetCollapsed(self, collapsed)
-		arrow.Text = self.Collapsed and "▸" or "▾"
+		if self._Destroyed then return self end
+		baseSetCollapsed(self, collapsed == true)
+		arrow.Text = self.Collapsed and "▶" or "▼"
+		arrow.TextColor3 = self.Collapsed and ProductivityColors.MutedText or ProductivityColors.Text
+		arrow:SetAttribute("LunaCollapsed", self.Collapsed)
 		EmitEvent("SectionCollapsed", self, self.Collapsed)
 		return self
 	end
-	ConnectComponent(section, button.MouseButton1Click, function()
+
+	function section:IsCollapsed()
+		return self.Collapsed == true
+	end
+
+	function section:Expand()
+		return self:SetCollapsed(false)
+	end
+
+	function section:Collapse()
+		return self:SetCollapsed(true)
+	end
+
+	local function toggleSection()
+		if not IsComponentUsable(section) then return end
 		section:Toggle()
+	end
+
+	ConnectComponent(section, titleButton.MouseButton1Click, toggleSection)
+	ConnectComponent(section, arrow.MouseButton1Click, toggleSection)
+	ConnectComponent(section, arrow.MouseEnter, function()
+		if not section._Destroyed then
+			tween(arrow, {TextColor3 = ProductivityColors.Text})
+		end
 	end)
+	ConnectComponent(section, arrow.MouseLeave, function()
+		if not section._Destroyed then
+			tween(arrow, {
+				TextColor3 = section.Collapsed and ProductivityColors.MutedText or ProductivityColors.Text,
+			})
+		end
+	end)
+
 	if settings.Tooltip then section:SetTooltip(settings.Tooltip) end
 	section:SetCollapsed(settings.DefaultExpanded == false or settings.Collapsed == true)
 	if section._Window then
@@ -4247,7 +4308,10 @@ local function EnhanceCollapsibleSection(section, settings)
 			Description = settings.Description or "Open section",
 			Category = section._Tab and section._Tab._Name or "Sections",
 			Component = section,
-			Action = function() FocusComponent(section) end,
+			Action = function()
+				section:Expand()
+				FocusComponent(section)
+			end,
 		})
 	end
 	return section
@@ -6525,6 +6589,18 @@ function Luna:CreateWindow(WindowSettings)
 
 			function Section:Toggle()
 				return Section:SetCollapsed(not Section.Collapsed)
+			end
+
+			function Section:IsCollapsed()
+				return Section.Collapsed == true
+			end
+
+			function Section:Expand()
+				return Section:SetCollapsed(false)
+			end
+
+			function Section:Collapse()
+				return Section:SetCollapsed(true)
 			end
 
 			function Section:Destroy()
