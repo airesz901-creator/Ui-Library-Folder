@@ -8110,8 +8110,9 @@ function Luna:CreateWindow(WindowSettings)
 
 					Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
 					Toggle.Title.Text = tostring(ToggleSettings.Name)
-					if Toggle.Desc ~= nil then
-						Toggle.Desc.Text = tostring(ToggleSettings.Description or "")
+					local ToggleDescription = Toggle:FindFirstChild("Desc")
+					if ToggleDescription then
+						ToggleDescription.Text = tostring(ToggleSettings.Description or "")
 					end
 
 					local shouldFire = NewToggleSettings.Silent ~= true
@@ -9767,8 +9768,9 @@ function Luna:CreateWindow(WindowSettings)
 
 				Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
 				Toggle.Title.Text = tostring(ToggleSettings.Name)
-				if Toggle.Desc ~= nil then
-					Toggle.Desc.Text = tostring(ToggleSettings.Description or "")
+				local ToggleDescription = Toggle:FindFirstChild("Desc")
+				if ToggleDescription then
+					ToggleDescription.Text = tostring(ToggleSettings.Description or "")
 				end
 
 				local shouldFire = NewToggleSettings.Silent ~= true
