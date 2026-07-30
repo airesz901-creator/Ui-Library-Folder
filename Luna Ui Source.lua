@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.9 - Manual Autoload Selection"
+local Release = "Luna Custom 7.3.10 - Autoload Buttons"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -9995,8 +9995,8 @@ function Luna:CreateWindow(WindowSettings)
 			local selectedLabel
 			local listStatus
 			local autoloadLabel
-			local autoloadToggle
-			local syncAutoloadToggle
+			local setAutoloadButton
+			local deleteAutoloadButton
 
 			local Title = Elements.Template.Title:Clone()
 			Title.Text = "Configurations"
@@ -10043,20 +10043,6 @@ function Luna:CreateWindow(WindowSettings)
 				if configBrowser and type(configBrowser.SetSelected) == "function" then
 					configBrowser:SetSelected(selectedConfig)
 				end
-				if syncAutoloadToggle then
-					syncAutoloadToggle()
-				end
-			end
-
-			syncAutoloadToggle = function()
-				if not autoloadToggle or autoloadToggle._Destroyed then return end
-				local currentAutoload = Luna:GetAutoload()
-				local selectedIsAutoload = selectedConfig ~= nil
-					and currentAutoload == selectedConfig
-				-- Keep the toggle visually available even when no config is selected.
-				-- Disabling it during its entrance tween could capture TextTransparency = 1
-				-- as the original value and make the title permanently invisible.
-				autoloadToggle:UpdateState(selectedIsAutoload, true)
 			end
 
 			local function makeBrowserRows(options)
@@ -10482,51 +10468,51 @@ function Luna:CreateWindow(WindowSettings)
 				refreshSelection(nil, false)
 			end})
 
-			autoloadToggle = Tab:CreateToggle({
+			setAutoloadButton = Tab:CreateButton({
 				Name = "Set as Autoload",
-				Description = "Turn on to autoload the selected config. Turn off to disable its autoload.",
-				CurrentValue = false,
-				FireOnInit = false,
-				FireOnSet = true,
-				Callback = function(enabled)
-					local name = selectedConfig
-					if not name then
-						notify("Please select a config first.", "warning")
-						syncAutoloadToggle()
+				Description = "Set the currently selected config to load automatically next session.",
+				Callback = function()
+					local name = requireSelected()
+					if not name then return end
+
+					local success, result = Luna:SetAutoload(name)
+					if not success then
+						notify("Unable to set autoload: " .. tostring(result), "error")
+						refreshSelection(name, false)
 						return
 					end
 
-					if enabled then
-						local success, result = Luna:SetAutoload(name)
-						if not success then
-							notify("Unable to set autoload: " .. tostring(result), "error")
-							syncAutoloadToggle()
-							return
-						end
-						notify(string.format("Set %q to autoload", result), "check_circle")
-					else
-						local currentAutoload = Luna:GetAutoload()
-						if currentAutoload ~= name then
-							syncAutoloadToggle()
-							return
-						end
-						local success, result = Luna:DeleteAutoload()
-						if not success then
-							notify("Unable to disable autoload: " .. tostring(result), "error")
-							syncAutoloadToggle()
-							return
-						end
-						notify("Autoload disabled", "check_circle")
-					end
+					notify(string.format("Set %q to autoload", result), "check_circle")
 					refreshSelection(name, false)
 				end,
 			})
 
-			-- Do not automatically select the saved autoload config when the panel opens.
-			-- The toggle must remain OFF until the user explicitly selects a config.
-			-- Existing autoload information is still shown by the Autoload Config label.
+			deleteAutoloadButton = Tab:CreateButton({
+				Name = "Delete Autoload",
+				Description = "Disable automatic config loading without deleting any saved config.",
+				Callback = function()
+					local currentAutoload = Luna:GetAutoload()
+					if not currentAutoload then
+						notify("Autoload is already disabled.", "info")
+						refreshSelection(selectedConfig, true)
+						return
+					end
+
+					local success, result = Luna:DeleteAutoload()
+					if not success then
+						notify("Unable to delete autoload: " .. tostring(result), "error")
+						refreshSelection(selectedConfig, true)
+						return
+					end
+
+					notify(string.format("Deleted autoload %q", currentAutoload), "check_circle")
+					refreshSelection(selectedConfig, true)
+				end,
+			})
+
+			-- Keep selection manual when the panel opens. Existing autoload status is
+			-- shown only in the Autoload Config paragraph until the user selects a file.
 			refreshSelection(nil, false)
-			autoloadToggle:UpdateState(false, true)
 			return {
 				Refresh = function(_, selectName) return refreshSelection(selectName, true) end,
 				GetSelected = function() return selectedConfig end,
@@ -10535,7 +10521,8 @@ function Luna:CreateWindow(WindowSettings)
 					return table.find(options, tostring(name)) ~= nil
 				end,
 				Browser = configBrowser,
-				AutoloadToggle = autoloadToggle,
+				SetAutoloadButton = setAutoloadButton,
+				DeleteAutoloadButton = deleteAutoloadButton,
 			}
 		end
 
