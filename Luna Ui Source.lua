@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.5 - Config Browser Hotfix"
+local Release = "Luna Custom 7.3.6 - Collapsible Config Selector"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -9979,6 +9979,7 @@ function Luna:CreateWindow(WindowSettings)
 				BrowserHeight = 190,
 				Searchable = true,
 				Sortable = true,
+				DefaultExpanded = true,
 			}, ConfigUISettings or {})
 
 			local inputPath = ""
@@ -9987,7 +9988,6 @@ function Luna:CreateWindow(WindowSettings)
 			local deleteCandidate
 			local deleteCandidateTime = 0
 			local deleteAllCandidateTime = 0
-			local configSelection
 			local configBrowser
 			local selectedLabel
 			local listStatus
@@ -10067,14 +10067,6 @@ function Luna:CreateWindow(WindowSettings)
 					selectName = nil
 				end
 
-				if configSelection then
-					configSelection:Set({
-						Options = options,
-						CurrentOption = selectName and {selectName} or {},
-						Silent = true,
-					})
-				end
-
 				if configBrowser then
 					configBrowser:SetRows(makeBrowserRows(options))
 				end
@@ -10139,49 +10131,36 @@ function Luna:CreateWindow(WindowSettings)
 			selectedLabel = Tab:CreateParagraph({Title = "Selected Config", Text = "None"})
 			autoloadLabel = Tab:CreateParagraph({Title = "Autoload Config", Text = "None"})
 
-			configSelection = Tab:CreateDropdown({
-				Name = "Select Config",
-				Description = "Open the list to choose a saved config. The chosen name appears above.",
-				Options = {},
-				CurrentOption = {},
-				MultipleOptions = false,
-				Callback = function(value)
-					updateSelectedVisual(value)
-				end,
-			})
-
-			local selectorPrompt = "Choose a saved config..."
-			local selectorObject = configSelection and configSelection._Object
-			local selectorTextBox = selectorObject and selectorObject:FindFirstChild("Selected")
-			local enforcingSelectorPrompt = false
-
-			local function keepSelectorPrompt()
-				if enforcingSelectorPrompt or not selectorTextBox or not selectorTextBox.Parent then return end
-				if selectorTextBox.PlaceholderText ~= selectorPrompt then
-					enforcingSelectorPrompt = true
-					selectorTextBox.PlaceholderText = selectorPrompt
-					enforcingSelectorPrompt = false
-				end
-			end
-
-			if selectorTextBox then
-				ConnectComponent(
-					configSelection,
-					selectorTextBox:GetPropertyChangedSignal("PlaceholderText"),
-					keepSelectorPrompt
-				)
-				keepSelectorPrompt()
-			end
-
 			if ConfigUISettings.ShowBrowser ~= false then
-				local browserHeight = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190)
-				local browserCard = CreateCard(TabPage, "Saved Config Browser", browserHeight)
-				local browserTitle = CreateText(browserCard, "Saved Config Browser", 14, true)
-				browserTitle.Position = UDim2.fromOffset(14, 7)
-				browserTitle.Size = UDim2.new(1, -28, 0, 20)
+				local expandedHeight = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190)
+				local collapsedHeight = 36
+				local expanded = ConfigUISettings.DefaultExpanded ~= false
+				local browserCard = CreateCard(
+					TabPage,
+					"Select Config",
+					expanded and expandedHeight or collapsedHeight
+				)
+				browserCard.ClipsDescendants = true
+
+				local headerButton = Instance.new("TextButton")
+				headerButton.Name = "Header"
+				headerButton.Active = true
+				headerButton.AutoButtonColor = false
+				headerButton.BackgroundColor3 = Color3.fromRGB(32, 30, 38)
+				headerButton.BackgroundTransparency = 0.55
+				headerButton.BorderSizePixel = 0
+				headerButton.Font = Enum.Font.GothamSemibold
+				headerButton.TextColor3 = ProductivityColors.Text
+				headerButton.TextSize = 14
+				headerButton.TextXAlignment = Enum.TextXAlignment.Left
+				headerButton.Position = UDim2.fromOffset(0, 0)
+				headerButton.Size = UDim2.new(1, 0, 0, collapsedHeight)
+				headerButton.ZIndex = browserCard.ZIndex + 2
+				headerButton.Parent = browserCard
+				CreatePadding(headerButton, 14, 10, 0, 0)
 
 				local searchBox
-				local topOffset = 31
+				local topOffset = collapsedHeight + 7
 				if ConfigUISettings.Searchable ~= false then
 					searchBox = Instance.new("TextBox")
 					searchBox.Name = "Search"
@@ -10198,10 +10177,12 @@ function Luna:CreateWindow(WindowSettings)
 					searchBox.TextXAlignment = Enum.TextXAlignment.Left
 					searchBox.Position = UDim2.fromOffset(14, topOffset)
 					searchBox.Size = UDim2.new(1, -28, 0, 28)
+					searchBox.Visible = expanded
+					searchBox.ZIndex = browserCard.ZIndex + 1
 					searchBox.Parent = browserCard
 					CreateCorner(searchBox, 6)
 					CreatePadding(searchBox, 9, 9, 0, 0)
-					topOffset += 34
+					topOffset = topOffset + 34
 				end
 
 				local rowsFrame = Instance.new("ScrollingFrame")
@@ -10214,6 +10195,8 @@ function Luna:CreateWindow(WindowSettings)
 				rowsFrame.ScrollBarImageColor3 = Color3.fromRGB(95, 93, 108)
 				rowsFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
 				rowsFrame.CanvasSize = UDim2.new()
+				rowsFrame.Visible = expanded
+				rowsFrame.ZIndex = browserCard.ZIndex + 1
 				rowsFrame.Parent = browserCard
 
 				local rowsLayout = Instance.new("UIListLayout")
@@ -10228,8 +10211,27 @@ function Luna:CreateWindow(WindowSettings)
 					Class = "ConfigBrowser",
 					Rows = {},
 					Selected = nil,
+					Expanded = expanded,
 					_Object = browserCard,
 				}
+
+				local function updateHeader()
+					headerButton.Text = (expanded and "▼  " or "▶  ") .. "Select Config"
+				end
+
+				local function applyExpanded(state)
+					expanded = state ~= false
+					browser.Expanded = expanded
+					browserCard.Size = UDim2.new(
+						1,
+						0,
+						0,
+						expanded and expandedHeight or collapsedHeight
+					)
+					if searchBox then searchBox.Visible = expanded end
+					rowsFrame.Visible = expanded
+					updateHeader()
+				end
 
 				local function renderBrowserRows()
 					DisconnectConnections(rowConnections)
@@ -10243,7 +10245,7 @@ function Luna:CreateWindow(WindowSettings)
 						if name and name:lower() ~= "nil"
 							and (filterText == "" or name:lower():find(filterText, 1, true))
 						then
-							visibleCount += 1
+							visibleCount = visibleCount + 1
 							local isSelected = selectedName == name
 							local rowButton = Instance.new("TextButton")
 							rowButton.Name = "Config - " .. name
@@ -10275,13 +10277,7 @@ function Luna:CreateWindow(WindowSettings)
 								end
 							end), rowConnections)
 							TrackConnection(rowButton.MouseButton1Click:Connect(function()
-								selectedName = name
-								browser.Selected = name
-								renderBrowserRows()
 								updateSelectedVisual(name)
-								if configSelection then
-									configSelection:Set({CurrentOption = {name}, Silent = true})
-								end
 								browser:_EmitChanged(name, nil, {
 									Source = "ConfigBrowser",
 									Selected = true,
@@ -10337,24 +10333,55 @@ function Luna:CreateWindow(WindowSettings)
 					return self
 				end
 
+				function browser:SetExpanded(state)
+					applyExpanded(state)
+					return self
+				end
+
+				function browser:Expand()
+					return self:SetExpanded(true)
+				end
+
+				function browser:Collapse()
+					return self:SetExpanded(false)
+				end
+
+				function browser:Toggle()
+					return self:SetExpanded(not expanded)
+				end
+
+				function browser:IsExpanded()
+					return expanded
+				end
+
 				function browser:Destroy()
 					DisconnectConnections(rowConnections)
 					if browserCard.Parent then browserCard:Destroy() end
 				end
 
 				configBrowser = EnhanceComponent(browser)
+				ConnectComponent(configBrowser, headerButton.MouseEnter, function()
+					headerButton.BackgroundTransparency = 0.35
+				end)
+				ConnectComponent(configBrowser, headerButton.MouseLeave, function()
+					headerButton.BackgroundTransparency = 0.55
+				end)
+				ConnectComponent(configBrowser, headerButton.MouseButton1Click, function()
+					configBrowser:Toggle()
+				end)
 				if searchBox then
 					ConnectComponent(configBrowser, searchBox:GetPropertyChangedSignal("Text"), function()
 						filterText = searchBox.Text:lower()
 						renderBrowserRows()
 					end)
 				end
+				applyExpanded(expanded)
 				configBrowser:SetRows({})
 			end
 
 			Tab:CreateButton({
 				Name = "Refresh Config List",
-				Description = "Refresh the dropdown and visible saved-config browser.",
+				Description = "Refresh the Select Config list.",
 				Callback = function()
 					refreshSelection(nil, true)
 				end,
@@ -10459,7 +10486,6 @@ function Luna:CreateWindow(WindowSettings)
 					local options = refreshSelection(name, false)
 					return table.find(options, tostring(name)) ~= nil
 				end,
-				Dropdown = configSelection,
 				Browser = configBrowser,
 			}
 		end
