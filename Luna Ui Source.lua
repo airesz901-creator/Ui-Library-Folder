@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.2 - Section Render Hotfix"
+local Release = "Luna Custom 7.3.3 - Legacy Config Browser"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -60,6 +60,7 @@ Luna._NotificationHistory = {}
 Luna._NotificationById = {}
 Luna._Themes = {}
 Luna._Windows = setmetatable({}, {__mode = "k"})
+Luna._KnownConfigs = {}
 Luna._Stats = {
 	CallbackErrors = 0,
 	NotificationsCreated = 0,
@@ -9972,11 +9973,24 @@ function Luna:CreateWindow(WindowSettings)
 			return ColorPickerV
 		end
 
-		function Tab:BuildConfigSection()
-			local inputPath
+		function Tab:BuildConfigSection(ConfigUISettings)
+			ConfigUISettings = Kwargify({
+				ShowBrowser = true,
+				BrowserHeight = 190,
+				Searchable = true,
+				Sortable = true,
+			}, ConfigUISettings or {})
+
+			local inputPath = ""
+			local renamePath = ""
 			local selectedConfig
 			local deleteCandidate
 			local deleteCandidateTime = 0
+			local configSelection
+			local configBrowser
+			local selectedLabel
+			local listStatus
+			local autoloadLabel
 
 			local Title = Elements.Template.Title:Clone()
 			Title.Text = "Configurations"
@@ -9986,7 +10000,19 @@ function Luna:CreateWindow(WindowSettings)
 			TweenService:Create(Title, TweenInfo.new(0.4, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
 
 			local function notify(content, icon)
-				Luna:Notification({Title = "Interface", Icon = icon or "info", ImageSource = "Material", Content = content})
+				Luna:Notification({
+					Title = "Configurations",
+					Icon = icon or "info",
+					ImageSource = "Material",
+					Content = content,
+				})
+			end
+
+			local function normalizeSelection(value)
+				if type(value) == "table" then value = value[1] end
+				value = value == nil and nil or tostring(value)
+				if value == "" or value == "No saved configs" then return nil end
+				return value
 			end
 
 			local function requireSelected()
@@ -9997,6 +10023,85 @@ function Luna:CreateWindow(WindowSettings)
 				return selectedConfig
 			end
 
+			local function updateSelectedVisual(name)
+				selectedConfig = normalizeSelection(name)
+				if selectedLabel then
+					selectedLabel:Set({
+						Title = "Selected Config",
+						Text = selectedConfig or "None",
+					})
+				end
+			end
+
+			local function makeBrowserRows(options)
+				local rows = {}
+				local currentAutoload = Luna:GetAutoload()
+				for _, name in ipairs(options) do
+					table.insert(rows, {
+						name,
+						currentAutoload == name and "Yes" or "",
+					})
+				end
+				if #rows == 0 then
+					table.insert(rows, {"No saved configs", ""})
+				end
+				return rows
+			end
+
+			local function refreshSelection(selectName, preserveSelection)
+				local options = Luna:RefreshConfigList()
+				selectName = normalizeSelection(selectName)
+
+				if not selectName and preserveSelection and selectedConfig
+					and table.find(options, selectedConfig)
+				then
+					selectName = selectedConfig
+				end
+				if selectName and not table.find(options, selectName) then
+					selectName = nil
+				end
+
+				if configSelection then
+					configSelection:Set({
+						Options = options,
+						CurrentOption = selectName and {selectName} or {},
+						Silent = true,
+					})
+				end
+
+				if configBrowser then
+					configBrowser:SetRows(makeBrowserRows(options))
+				end
+
+				updateSelectedVisual(selectName)
+
+				if listStatus then
+					local listingSupported = type(listfiles) == "function"
+					local message
+					if #options > 0 then
+						message = string.format(
+							"%d config(s) found in %s/settings",
+							#options,
+							tostring(Luna.Folder)
+						)
+					elseif listingSupported then
+						message = "No saved configs found. Create one above, then press Refresh."
+					else
+						message = "Executor does not support listfiles. Configs created in this session will still appear."
+					end
+					listStatus:Set({Title = "Config List", Text = message})
+				end
+
+				if autoloadLabel then
+					local currentAutoload = Luna:GetAutoload()
+					autoloadLabel:Set({
+						Title = "Current Auto Load",
+						Text = currentAutoload or "None",
+					})
+				end
+				return options
+			end
+
 			Tab:CreateSection("Config Creator")
 			Tab:CreateInput({
 				Name = "Config Name",
@@ -10005,37 +10110,65 @@ function Luna:CreateWindow(WindowSettings)
 				CurrentValue = "",
 				Numeric = false,
 				Enter = false,
-				Callback = function(input) inputPath = input end,
+				Callback = function(input) inputPath = tostring(input or "") end,
 			})
-
-			local configSelection
-			local function refreshSelection(selectName)
-				local options = Luna:RefreshConfigList()
-				configSelection:Set({Options = options, CurrentOption = selectName and {selectName} or {}})
-				selectedConfig = selectName
-			end
 
 			Tab:CreateButton({
 				Name = "Create Config",
-				Description = "Save all current settings into a validated .json config.",
+				Description = "Save all current settings into a validated JSON config.",
 				Callback = function()
 					local success, result = Luna:SaveConfig(inputPath)
-					if not success then notify("Unable to save config: " .. tostring(result), "error"); return end
-					notify(string.format("Created config %q", result))
-					refreshSelection(result)
+					if not success then
+						notify("Unable to save config: " .. tostring(result), "error")
+						return
+					end
+					inputPath = result
+					notify(string.format("Created config %q", result), "check_circle")
+					refreshSelection(result, false)
+				end,
+			})
+
+			Tab:CreateSection("Saved Configs")
+			listStatus = Tab:CreateParagraph({Title = "Config List", Text = "Loading..."})
+			selectedLabel = Tab:CreateParagraph({Title = "Selected Config", Text = "None"})
+
+			configSelection = Tab:CreateDropdown({
+				Name = "Select Config",
+				Description = "Old Luna-style config selector. Open it to choose a saved config.",
+				Options = {},
+				CurrentOption = {},
+				MultipleOptions = false,
+				Callback = function(value)
+					updateSelectedVisual(value)
+				end,
+			})
+
+			if ConfigUISettings.ShowBrowser ~= false and type(Tab.CreateDataTable) == "function" then
+				configBrowser = Tab:CreateDataTable({
+					Name = "Saved Config Browser",
+					Columns = {"Config", "Autoload"},
+					Rows = {},
+					Height = math.max(140, tonumber(ConfigUISettings.BrowserHeight) or 190),
+					Searchable = ConfigUISettings.Searchable ~= false,
+					Sortable = ConfigUISettings.Sortable ~= false,
+					OnRowSelected = function(row)
+						local name = normalizeSelection(type(row) == "table" and row[1] or row)
+						if not name then return end
+						updateSelectedVisual(name)
+						configSelection:Set({CurrentOption = {name}, Silent = true})
+					end,
+				})
+			end
+
+			Tab:CreateButton({
+				Name = "Refresh Config List",
+				Description = "Refresh the dropdown and visible saved-config browser.",
+				Callback = function()
+					refreshSelection(nil, true)
 				end,
 			})
 
 			Tab:CreateSection("Config Load/Settings")
-			configSelection = Tab:CreateDropdown({
-				Name = "Select Config",
-				Description = "Select a saved JSON config.",
-				Options = Luna:RefreshConfigList(),
-				CurrentOption = {},
-				MultipleOptions = false,
-				Callback = function(value) selectedConfig = value end,
-			})
-
 			Tab:CreateButton({Name = "Load Config", Description = "Load the selected config.", Callback = function()
 				local name = requireSelected(); if not name then return end
 				local success, result, warnings = Luna:LoadConfig(name)
@@ -10043,7 +10176,7 @@ function Luna:CreateWindow(WindowSettings)
 				if type(warnings) == "table" and #warnings > 0 then
 					notify(string.format("Loaded %q with %d skipped setting(s).", name, #warnings), "warning")
 				else
-					notify(string.format("Loaded config %q", name))
+					notify(string.format("Loaded config %q", name), "check_circle")
 				end
 			end})
 
@@ -10051,7 +10184,26 @@ function Luna:CreateWindow(WindowSettings)
 				local name = requireSelected(); if not name then return end
 				local success, result = Luna:SaveConfig(name)
 				if not success then notify("Unable to overwrite config: " .. tostring(result), "error"); return end
-				notify(string.format("Overwrote config %q", result))
+				notify(string.format("Overwrote config %q", result), "check_circle")
+				refreshSelection(result, false)
+			end})
+
+			Tab:CreateInput({
+				Name = "Rename Selected Config",
+				Description = "Enter a new name, then press Rename Config.",
+				PlaceholderText = "New name",
+				CurrentValue = "",
+				Enter = false,
+				Callback = function(value) renamePath = tostring(value or "") end,
+			})
+
+			Tab:CreateButton({Name = "Rename Config", Description = "Rename the selected config without changing its contents.", Callback = function()
+				local name = requireSelected(); if not name then return end
+				local success, result = Luna:RenameConfig(name, renamePath)
+				if not success then notify("Unable to rename config: " .. tostring(result), "error"); return end
+				notify(string.format("Renamed %q to %q", name, result), "check_circle")
+				renamePath = result
+				refreshSelection(result, false)
 			end})
 
 			Tab:CreateButton({Name = "Delete Config", Description = "Press twice within 5 seconds to confirm deletion.", Callback = function()
@@ -10064,32 +10216,37 @@ function Luna:CreateWindow(WindowSettings)
 				local success, result = Luna:DeleteConfig(name)
 				deleteCandidate = nil
 				if not success then notify("Unable to delete config: " .. tostring(result), "error"); return end
-				notify(string.format("Deleted config %q", name))
-				refreshSelection(nil)
+				notify(string.format("Deleted config %q", name), "check_circle")
+				refreshSelection(nil, false)
 			end})
 
-			Tab:CreateButton({Name = "Refresh Config List", Description = "Refresh the saved .json config list.", Callback = function()
-				refreshSelection(nil)
-			end})
-
-			local loadlabel = Tab:CreateParagraph({Title = "Current Auto Load", Text = "None"})
-			Tab:CreateButton({Name = "Set as autoload", Description = "Automatically load the selected config next session.", Callback = function()
+			autoloadLabel = Tab:CreateParagraph({Title = "Current Auto Load", Text = "None"})
+			Tab:CreateButton({Name = "Set as Autoload", Description = "Automatically load the selected config next session.", Callback = function()
 				local name = requireSelected(); if not name then return end
 				local success, result = Luna:SetAutoload(name)
 				if not success then notify("Unable to set autoload: " .. tostring(result), "error"); return end
-				loadlabel:Set({Text = "Current autoload config: " .. result})
-				notify(string.format("Set %q to auto load", result))
+				notify(string.format("Set %q to autoload", result), "check_circle")
+				refreshSelection(name, false)
 			end})
 
 			Tab:CreateButton({Name = "Delete Autoload", Description = "Disable automatic config loading.", Callback = function()
 				local success, result = Luna:DeleteAutoload()
 				if not success then notify("Unable to delete autoload: " .. tostring(result), "error"); return end
-				loadlabel:Set({Text = "None"})
-				notify("Deleted autoload")
+				notify("Deleted autoload", "check_circle")
+				refreshSelection(selectedConfig, false)
 			end})
 
-			local currentAutoload = Luna:GetAutoload()
-			if currentAutoload then loadlabel:Set({Text = "Current autoload config: " .. currentAutoload}) end
+			refreshSelection(nil, false)
+			return {
+				Refresh = function(_, selectName) return refreshSelection(selectName, true) end,
+				GetSelected = function() return selectedConfig end,
+				Select = function(_, name)
+					local options = refreshSelection(name, false)
+					return table.find(options, tostring(name)) ~= nil
+				end,
+				Dropdown = configSelection,
+				Browser = configBrowser,
+			}
 		end
 
 		local ClassParser = {
@@ -10606,6 +10763,7 @@ function Luna:CreateWindow(WindowSettings)
 				return false, writeError
 			end
 
+			Luna._KnownConfigs[safeName] = true
 			EmitEvent("ConfigSaved", safeName, data)
 			return true, safeName
 		end
@@ -10730,27 +10888,37 @@ function Luna:CreateWindow(WindowSettings)
 			end
 
 			Luna._Stats.ConfigWarnings += #warnings
+			Luna._KnownConfigs[safeName] = true
 			EmitEvent("ConfigLoaded", safeName, warnings)
 			return true, safeName, warnings
 		end
 
 		function Luna:RefreshConfigList()
-			if type(listfiles) ~= "function" then return {} end
-
-			local folderSuccess = BuildFolderTree()
-			if not folderSuccess then return {} end
-
-			local success, files =
-				pcall(listfiles, Luna.Folder .. "/settings")
-			if not success or type(files) ~= "table" then return {} end
-
 			local output = {}
-			for _, filePath in ipairs(files) do
-				local name = tostring(filePath):match(
-					"([^/\\]+)%.json$"
-				)
-				if name and name ~= "autoload" then
+			local seen = {}
+
+			local function addName(name)
+				name = ConfigName(name)
+				if name and name ~= "autoload" and not seen[name] then
+					seen[name] = true
 					table.insert(output, name)
+				end
+			end
+
+			for name in pairs(Luna._KnownConfigs or {}) do
+				addName(name)
+			end
+
+			if type(listfiles) == "function" then
+				local folderSuccess = BuildFolderTree()
+				if folderSuccess then
+					local success, files = pcall(listfiles, Luna.Folder .. "/settings")
+					if success and type(files) == "table" then
+						for _, filePath in ipairs(files) do
+							local name = tostring(filePath):match("([^/\\]+)%.json$")
+							if name then addName(name) end
+						end
+					end
 				end
 			end
 
@@ -10779,6 +10947,7 @@ function Luna:CreateWindow(WindowSettings)
 				self:DeleteAutoload()
 			end
 
+			Luna._KnownConfigs[safeName] = nil
 			return true, safeName
 		end
 
@@ -10835,6 +11004,8 @@ function Luna:CreateWindow(WindowSettings)
 				end
 			end
 
+			Luna._KnownConfigs[safeOld] = nil
+			Luna._KnownConfigs[safeNew] = true
 			return true, safeNew
 		end
 
@@ -10989,6 +11160,7 @@ function Luna:CreateWindow(WindowSettings)
 
 			local writeSuccess, writeError =
 				WriteVerifiedFile(fullPath, normalized)
+			if writeSuccess then Luna._KnownConfigs[safeName] = true end
 			return writeSuccess,
 				writeSuccess and safeName or writeError
 		end
