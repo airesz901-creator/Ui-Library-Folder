@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.10 - Autoload Buttons"
+local Release = "Luna Custom 7.3.11 - FPS & Clock"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -5657,6 +5657,7 @@ function Luna:CreateWindow(WindowSettings)
 
 		ConfigSettings = {},
 		MinimizeSettings = {},
+		StatusDisplay = {},
 	}, WindowSettings or {})
 
 	WindowSettings.ConfigSettings = Kwargify({
@@ -5670,6 +5671,16 @@ function Luna:CreateWindow(WindowSettings)
 		ShowNotification = true,
 		NotificationCooldown = 1.5,
 	}, WindowSettings.MinimizeSettings or {})
+
+	WindowSettings.StatusDisplay = Kwargify({
+		Enabled = true,
+		ShowFPS = true,
+		ShowClock = true,
+		ShowSeconds = false,
+		ClockFormat = "24h",
+		UpdateInterval = 0.5,
+		Separator = "  •  ",
+	}, WindowSettings.StatusDisplay or {})
 
 	if WindowSettings.ConfigSettings.RootFolder ~= nil and WindowSettings.ConfigSettings.RootFolder ~= "" then
 		Luna.Folder = tostring(WindowSettings.ConfigSettings.RootFolder) .. "/" .. tostring(WindowSettings.ConfigSettings.ConfigFolder)
@@ -5700,6 +5711,8 @@ function Luna:CreateWindow(WindowSettings)
 		State = true,
 		Size = false,
 		Settings = nil,
+		CurrentFPS = 0,
+		StatusDisplaySettings = WindowSettings.StatusDisplay,
 	}
 
 	-- Extra topbar hide button. The existing square button keeps the compact/minimize action,
@@ -5751,6 +5764,164 @@ function Luna:CreateWindow(WindowSettings)
 		end
 	end
 	Window.HideControl = HideControl
+
+	-- Lightweight topbar FPS and local clock display. FPS is averaged over the
+	-- selected update interval so the number stays readable instead of jumping
+	-- every rendered frame. The clock uses the executor/device local time.
+	local StatusDisplay = Main:FindFirstChild("LunaStatusDisplay")
+	if StatusDisplay then
+		StatusDisplay:Destroy()
+	end
+	StatusDisplay = Main.Title.subtitle:Clone()
+	StatusDisplay.Name = "LunaStatusDisplay"
+	StatusDisplay.BackgroundTransparency = 1
+	StatusDisplay.AnchorPoint = Vector2.new(1, 0.5)
+	StatusDisplay.Position = UDim2.new(1, -14, 0, 39)
+	StatusDisplay.Size = UDim2.fromOffset(210, 18)
+	StatusDisplay.Text = ""
+	StatusDisplay.TextXAlignment = Enum.TextXAlignment.Right
+	StatusDisplay.TextYAlignment = Enum.TextYAlignment.Center
+	StatusDisplay.TextTruncate = Enum.TextTruncate.AtEnd
+	StatusDisplay.TextWrapped = false
+	StatusDisplay.TextSize = math.max(10, math.min(14, tonumber(StatusDisplay.TextSize) or 12))
+	StatusDisplay.ZIndex = math.max(20, tonumber(Main.Controls.ZIndex) or 1)
+	StatusDisplay.TextTransparency = 1
+	StatusDisplay.Visible = WindowSettings.StatusDisplay.Enabled ~= false
+	StatusDisplay.Parent = Main
+	Window.StatusDisplay = StatusDisplay
+
+	local statusFrameCount = 0
+	local statusElapsed = 0
+	local statusLastClock = "--:--"
+
+	local function RefreshStatusLayout()
+		if not StatusDisplay or not StatusDisplay.Parent then return end
+		local mainWidth = math.max(0, Main.AbsoluteSize.X)
+		local width = math.clamp(mainWidth - 250, 100, 210)
+		StatusDisplay.Size = UDim2.fromOffset(width, 18)
+		StatusDisplay.TextSize = mainWidth < 440 and 10 or 12
+	end
+
+	local function FormatStatusClock()
+		local statusSettings = Window.StatusDisplaySettings
+		local use12Hour = tostring(statusSettings.ClockFormat or "24h"):lower() == "12h"
+		local showSeconds = statusSettings.ShowSeconds == true
+		local format
+		if use12Hour then
+			format = showSeconds and "%I:%M:%S %p" or "%I:%M %p"
+		else
+			format = showSeconds and "%H:%M:%S" or "%H:%M"
+		end
+		local success, clockText = pcall(os.date, format)
+		if not success or type(clockText) ~= "string" or clockText == "" then
+			return "--:--"
+		end
+		if use12Hour then
+			clockText = clockText:gsub("^0", "")
+		end
+		return clockText
+	end
+
+	local function RefreshStatusDisplay()
+		if Luna._Destroyed or not StatusDisplay or not StatusDisplay.Parent then
+			return
+		end
+		local statusSettings = Window.StatusDisplaySettings
+		local parts = {}
+		if statusSettings.ShowFPS ~= false then
+			table.insert(parts, (Window.CurrentFPS > 0 and tostring(Window.CurrentFPS) or "--") .. " FPS")
+		end
+		if statusSettings.ShowClock ~= false then
+			statusLastClock = FormatStatusClock()
+			table.insert(parts, statusLastClock)
+		end
+		StatusDisplay.Text = table.concat(parts, tostring(statusSettings.Separator or "  •  "))
+		StatusDisplay.Visible = Window.State
+			and statusSettings.Enabled ~= false
+			and #parts > 0
+	end
+
+	local function ResetStatusSample()
+		statusFrameCount = 0
+		statusElapsed = 0
+	end
+
+	TrackConnection(RunService.RenderStepped:Connect(function(deltaTime)
+		if Luna._Destroyed then return end
+		statusFrameCount += 1
+		statusElapsed += math.max(0, tonumber(deltaTime) or 0)
+		local interval = math.max(
+			0.2,
+			tonumber(Window.StatusDisplaySettings.UpdateInterval) or 0.5
+		)
+		if statusElapsed >= interval then
+			Window.CurrentFPS = math.max(0, math.floor((statusFrameCount / math.max(statusElapsed, 0.001)) + 0.5))
+			ResetStatusSample()
+			RefreshStatusDisplay()
+		end
+	end))
+
+	TrackConnection(Main.Title.subtitle:GetPropertyChangedSignal("TextColor3"):Connect(function()
+		if StatusDisplay and StatusDisplay.Parent then
+			StatusDisplay.TextColor3 = Main.Title.subtitle.TextColor3
+		end
+	end))
+	TrackConnection(Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(RefreshStatusLayout))
+
+	function Window:SetStatusDisplayEnabled(enabled)
+		self.StatusDisplaySettings.Enabled = enabled ~= false
+		RefreshStatusDisplay()
+		return self.StatusDisplaySettings.Enabled
+	end
+
+	function Window:SetFPSVisible(enabled)
+		self.StatusDisplaySettings.ShowFPS = enabled ~= false
+		RefreshStatusDisplay()
+		return self.StatusDisplaySettings.ShowFPS
+	end
+
+	function Window:SetClockVisible(enabled)
+		self.StatusDisplaySettings.ShowClock = enabled ~= false
+		RefreshStatusDisplay()
+		return self.StatusDisplaySettings.ShowClock
+	end
+
+	function Window:SetClockFormat(format)
+		format = tostring(format or "24h"):lower()
+		if format ~= "12h" and format ~= "24h" then
+			return false, "Clock format must be '12h' or '24h'."
+		end
+		self.StatusDisplaySettings.ClockFormat = format
+		RefreshStatusDisplay()
+		return true, format
+	end
+
+	function Window:SetClockSecondsVisible(enabled)
+		self.StatusDisplaySettings.ShowSeconds = enabled == true
+		RefreshStatusDisplay()
+		return self.StatusDisplaySettings.ShowSeconds
+	end
+
+	function Window:SetStatusUpdateInterval(seconds)
+		seconds = tonumber(seconds)
+		if not seconds then
+			return false, "Update interval must be a number."
+		end
+		self.StatusDisplaySettings.UpdateInterval = math.max(0.2, seconds)
+		ResetStatusSample()
+		return true, self.StatusDisplaySettings.UpdateInterval
+	end
+
+	function Window:GetFPS()
+		return self.CurrentFPS
+	end
+
+	function Window:GetClockText()
+		return FormatStatusClock()
+	end
+
+	RefreshStatusLayout()
+	RefreshStatusDisplay()
 
 	Main.Title.Title.Text = WindowSettings.Name
 	Main.Title.subtitle.Text = WindowSettings.Subtitle
@@ -5869,6 +6040,7 @@ function Luna:CreateWindow(WindowSettings)
 	TweenService:Create(Main.Parent.ShadowHolder, TweenInfo.new(0.5, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = MainSize}):Play()
 	TweenService:Create(Main.Title.Title, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
 	TweenService:Create(Main.Title.subtitle, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
+	TweenService:Create(StatusDisplay, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
 	TweenService:Create(Main.Logo, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0}):Play()
 	TweenService:Create(Navigation.Player.icon.ImageLabel, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {ImageTransparency = 0}):Play()
 	TweenService:Create(Navigation.Player.icon.UIStroke, TweenInfo.new(0.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Transparency = 0}):Play()
@@ -11510,6 +11682,7 @@ function Luna:CreateWindow(WindowSettings)
 		-- always sees the newest state, even when keys are spammed.
 		Window.State = false
 		dragBar.Visible = false
+		if StatusDisplay then StatusDisplay.Visible = false end
 
 		Hide(
 			Main,
@@ -11534,6 +11707,7 @@ function Luna:CreateWindow(WindowSettings)
 		LunaUI.MobileSupport.Visible = false
 		dragBar.Visible = true
 		Unhide(Main, Window.CurrentTab)
+		RefreshStatusDisplay()
 		EmitEvent("WindowOpened", Window)
 		return true
 	end
