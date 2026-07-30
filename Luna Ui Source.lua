@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.11 - FPS & Clock"
+local Release = "Luna Custom 7.3.12 - ZIndex Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -5784,7 +5784,17 @@ function Luna:CreateWindow(WindowSettings)
 	StatusDisplay.TextTruncate = Enum.TextTruncate.AtEnd
 	StatusDisplay.TextWrapped = false
 	StatusDisplay.TextSize = math.max(10, math.min(14, tonumber(StatusDisplay.TextSize) or 12))
-	StatusDisplay.ZIndex = math.max(20, tonumber(Main.Controls.ZIndex) or 1)
+	-- Main.Controls / Control is a Folder in the current Luna asset, so it has no ZIndex.
+	-- Read the layer only from real GuiObjects and keep a safe fallback.
+	local statusBaseZIndex = 1
+	local statusSubtitle = Main:FindFirstChild("Title")
+		and Main.Title:FindFirstChild("subtitle")
+	if statusSubtitle and statusSubtitle:IsA("GuiObject") then
+		statusBaseZIndex = statusSubtitle.ZIndex
+	elseif Main:IsA("GuiObject") then
+		statusBaseZIndex = Main.ZIndex
+	end
+	StatusDisplay.ZIndex = math.max(20, statusBaseZIndex + 1)
 	StatusDisplay.TextTransparency = 1
 	StatusDisplay.Visible = WindowSettings.StatusDisplay.Enabled ~= false
 	StatusDisplay.Parent = Main
