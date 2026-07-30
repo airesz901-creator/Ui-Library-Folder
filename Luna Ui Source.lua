@@ -11279,6 +11279,21 @@ function Luna:CreateWindow(WindowSettings)
 			-- shown only in the Autoload Config paragraph until the user selects a file.
 			Luna:RepairConfigState()
 			refreshSelection(nil, false)
+
+			-- Building the config section normally happens after the hub has created
+			-- all of its flagged controls. Load the selected autoload config here so
+			-- every saved flag can be resolved against Luna.Options.
+			if not Luna._AutoloadAttempted and Luna:GetAutoload() then
+				Luna._AutoloadAttempted = true
+				task.defer(function()
+					if Luna._Destroyed then return end
+					local success, result = Luna:LoadAutoloadConfig()
+					if not success then
+						warn("Luna UI: " .. tostring(result))
+					end
+				end)
+			end
+
 			return {
 				Refresh = function(_, selectName) return refreshSelection(selectName, true) end,
 				GetSelected = function() return selectedConfig end,
