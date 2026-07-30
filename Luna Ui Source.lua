@@ -1,4 +1,4 @@
-local Release = "Luna Final 7.0.10 - No Key System"
+local Release = "Luna Custom 7.2.0 - Stability & Performance"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -8,6 +8,9 @@ local Luna = {
 	ConfigExtension = ".json",
 	Version = Release,
 	MaxNotifications = 3,
+	NotificationBlurEnabled = false,
+	WindowBlurEnabled = true,
+	StrictConfig = false,
 }
 
 local UserInputService = game:GetService("UserInputService")
@@ -18,21 +21,44 @@ local Localization = game:GetService("LocalizationService")
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
+
+local function GetCurrentCamera()
+	Camera = workspace.CurrentCamera or Camera
+	return Camera
+end
 local CoreGui = game:GetService("CoreGui")
 local ContentProvider = game:GetService("ContentProvider")
 
+-- Destroy a previously loaded Luna instance before creating another one.
+local GlobalEnvironment = (type(getgenv) == "function" and getgenv()) or _G
+if type(GlobalEnvironment) ~= "table" then
+	GlobalEnvironment = _G
+end
+local PreviousLuna = rawget(GlobalEnvironment, "__LUNA_ACTIVE_LIBRARY")
+if type(PreviousLuna) == "table"
+	and PreviousLuna ~= Luna
+	and type(PreviousLuna.Destroy) == "function"
+then
+	pcall(function()
+		PreviousLuna:Destroy()
+	end)
+end
 -- Final lifecycle, diagnostics, and utility layer.
 Luna._Connections = {}
 Luna._Cleanups = {}
 Luna._Components = setmetatable({}, {__mode = "k"})
 Luna._Destroyed = false
 Luna._NotificationQueue = {}
+Luna._ToggleGroups = {}
+Luna._MutatingToggleGroups = {}
 Luna._Stats = {
 	CallbackErrors = 0,
 	NotificationsCreated = 0,
 	ActiveNotifications = 0,
 	RenderLoops = 0,
 	DuplicateFlags = 0,
+	ConfigRollbacks = 0,
+	ConfigWarnings = 0,
 }
 
 local function TrackConnection(connection, bucket)
@@ -254,6 +280,191 @@ local function RemoveOption(option)
 	end
 end
 
+
+-- Exclusive toggle groups. Any toggles sharing the same Group value behave like
+-- radio buttons: enabling one automatically disables the others in that group.
+local function NormalizeToggleGroup(group)
+	if group == nil or group == false then
+		return nil
+	end
+
+	group = tostring(group)
+	group = group:gsub("^%s+", ""):gsub("%s+$", "")
+	if group == "" then
+		return nil
+	end
+	return group
+end
+
+local function RemoveToggleFromGroup(toggle)
+	if not toggle then return end
+	local group = toggle._ToggleGroup
+	if not group then return end
+
+	local bucket = Luna._ToggleGroups[group]
+	if bucket then
+		bucket[toggle] = nil
+		if next(bucket) == nil then
+			Luna._ToggleGroups[group] = nil
+			Luna._MutatingToggleGroups[group] = nil
+		end
+	end
+	toggle._ToggleGroup = nil
+end
+
+local function RegisterToggleGroup(toggle, group)
+	RemoveToggleFromGroup(toggle)
+	group = NormalizeToggleGroup(group)
+	if not group then return nil end
+
+	local bucket = Luna._ToggleGroups[group]
+	if not bucket then
+		bucket = setmetatable({}, {__mode = "k"})
+		Luna._ToggleGroups[group] = bucket
+	end
+
+	bucket[toggle] = true
+	toggle._ToggleGroup = group
+	return group
+end
+
+local function ToggleSortKey(toggle)
+	if not toggle then return "" end
+	return tostring(toggle.Flag or "")
+		.. "\0"
+		.. tostring(toggle.Settings and toggle.Settings.Name or "")
+end
+
+local function GetToggleGroupMembers(group)
+	local bucket = group and Luna._ToggleGroups[group]
+	local members = {}
+	if bucket then
+		for member in pairs(bucket) do
+			if member and not member._Destroyed then
+				table.insert(members, member)
+			end
+		end
+	end
+	table.sort(members, function(a, b)
+		return ToggleSortKey(a) < ToggleSortKey(b)
+	end)
+	return members
+end
+
+local function ToggleGroupAllowsNone(group)
+	for _, member in ipairs(GetToggleGroupMembers(group)) do
+		if member.Settings and member.Settings.AllowNone == false then
+			return false
+		end
+	end
+	return true
+end
+
+local function ToggleGroupHasOtherActive(toggle)
+	local group = toggle and toggle._ToggleGroup
+	for _, member in ipairs(GetToggleGroupMembers(group)) do
+		if member ~= toggle and member.CurrentValue == true then
+			return true
+		end
+	end
+	return false
+end
+
+local function BeginToggleGroupMutation(group)
+	if not group then return true end
+	if Luna._MutatingToggleGroups[group] then
+		return false
+	end
+	Luna._MutatingToggleGroups[group] = true
+	return true
+end
+
+local function EndToggleGroupMutation(group)
+	if group then
+		Luna._MutatingToggleGroups[group] = nil
+	end
+end
+
+local function DeactivateToggleGroup(activeToggle)
+	local group = activeToggle and activeToggle._ToggleGroup
+	local deactivated = {}
+	for _, member in ipairs(GetToggleGroupMembers(group)) do
+		if member ~= activeToggle
+			and member.CurrentValue == true
+			and type(member._ApplyExclusiveState) == "function"
+		then
+			member:_ApplyExclusiveState(false, false)
+			table.insert(deactivated, member)
+		end
+	end
+	return deactivated
+end
+
+local function NormalizeAllToggleGroups(fireCallbacks)
+	for group in pairs(Luna._ToggleGroups) do
+		local members = GetToggleGroupMembers(group)
+		local active = {}
+
+		for _, member in ipairs(members) do
+			if member.CurrentValue == true then
+				table.insert(active, member)
+			end
+		end
+
+		local changed = {}
+		if #active > 1 then
+			local keeper = active[1]
+			for index = 2, #active do
+				local member = active[index]
+				if type(member._ApplyExclusiveState) == "function" then
+					member:_ApplyExclusiveState(false, false)
+					table.insert(changed, {Member = member, State = false})
+				end
+			end
+			if keeper and type(keeper._ApplyExclusiveState) == "function" then
+				keeper:_ApplyExclusiveState(true, false)
+			end
+		elseif #active == 0
+			and #members > 0
+			and not ToggleGroupAllowsNone(group)
+		then
+			local member = members[1]
+			if type(member._ApplyExclusiveState) == "function" then
+				member:_ApplyExclusiveState(true, false)
+				table.insert(changed, {Member = member, State = true})
+			end
+		end
+
+		if fireCallbacks == true then
+			for _, item in ipairs(changed) do
+				if type(item.Member._EmitExclusiveCallback) == "function" then
+					item.Member:_EmitExclusiveCallback(item.State)
+				end
+			end
+		end
+	end
+	return true
+end
+
+function Luna:NormalizeToggleGroups(fireCallbacks)
+	return NormalizeAllToggleGroups(fireCallbacks == true)
+end
+
+local ValueComponentClasses = {
+	Toggle = true,
+	Slider = true,
+	Input = true,
+	Dropdown = true,
+	Colorpicker = true,
+	Bind = true,
+}
+
+local function StoreOriginalBoolean(instance, attributeName, value)
+	if instance:GetAttribute(attributeName) == nil then
+		instance:SetAttribute(attributeName, value == true)
+	end
+end
+
 local function EnhanceComponent(component)
 	if type(component) ~= "table" then
 		return component
@@ -265,15 +476,21 @@ local function EnhanceComponent(component)
 	component._Destroyed = component._Destroyed == true
 	component._Connections = component._Connections or {}
 
-	if component.Set and not component.SetValue then
+	if ValueComponentClasses[component.Class]
+		and component.Set
+		and not component.SetValue
+	then
 		function component:SetValue(value, silent)
 			if self._Destroyed then return self end
 			if self.Class == "Dropdown" then
-				self:Set({CurrentOption = type(value) == "table" and value or {value}, Silent = silent == true})
+				self:Set({
+					CurrentOption = type(value) == "table" and value or {value},
+					Silent = silent == true,
+				})
 			elseif self.Class == "Colorpicker" then
 				self:Set({Color = value, Silent = silent == true})
 			elseif self.Class == "Bind" then
-				self:Set({CurrentBind = tostring(value), Silent = silent == true})
+				self:Set({CurrentBind = value, Silent = silent == true})
 			else
 				self:Set({CurrentValue = value, Silent = silent == true})
 			end
@@ -281,7 +498,7 @@ local function EnhanceComponent(component)
 		end
 	end
 
-	if not component.GetValue then
+	if ValueComponentClasses[component.Class] and not component.GetValue then
 		function component:GetValue()
 			if self.Class == "Dropdown" then
 				return self.CurrentOption
@@ -296,7 +513,10 @@ local function EnhanceComponent(component)
 
 	if component.Class == "Dropdown" and component.Set and not component.SetOptions then
 		function component:SetOptions(options, silent)
-			self:Set({Options = type(options) == "table" and options or {}, Silent = silent == true})
+			self:Set({
+				Options = type(options) == "table" and options or {},
+				Silent = silent == true,
+			})
 			return self
 		end
 	end
@@ -319,34 +539,67 @@ local function EnhanceComponent(component)
 			disabled = disabled == true
 			self.Disabled = disabled
 			local object = self._Object
+
 			if object then
 				object:SetAttribute("LunaDisabled", disabled)
-				for _, item in ipairs(object:GetDescendants()) do
+				local descendants = object:GetDescendants()
+				table.insert(descendants, object)
+
+				for _, item in ipairs(descendants) do
 					if item:IsA("GuiButton") then
-						item.Active = not disabled
-						item.AutoButtonColor = not disabled
+						StoreOriginalBoolean(item, "LunaOriginalActive", item.Active)
+						StoreOriginalBoolean(item, "LunaOriginalAutoButtonColor", item.AutoButtonColor)
+						if disabled then
+							item.Active = false
+							item.AutoButtonColor = false
+						else
+							item.Active = item:GetAttribute("LunaOriginalActive") == true
+							item.AutoButtonColor =
+								item:GetAttribute("LunaOriginalAutoButtonColor") == true
+						end
 					elseif item:IsA("TextBox") then
-						item.TextEditable = not disabled
+						StoreOriginalBoolean(item, "LunaOriginalTextEditable", item.TextEditable)
+						item.TextEditable = disabled
+							and false
+							or item:GetAttribute("LunaOriginalTextEditable") == true
 					end
 
-					if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+					if item:IsA("TextLabel")
+						or item:IsA("TextButton")
+						or item:IsA("TextBox")
+					then
 						if item:GetAttribute("LunaOriginalTextTransparency") == nil then
-							item:SetAttribute("LunaOriginalTextTransparency", item.TextTransparency)
+							item:SetAttribute(
+								"LunaOriginalTextTransparency",
+								item.TextTransparency
+							)
 						end
-						local original = item:GetAttribute("LunaOriginalTextTransparency") or 0
-						item.TextTransparency = disabled and math.max(original, 0.45) or original
+						local original =
+							item:GetAttribute("LunaOriginalTextTransparency") or 0
+						item.TextTransparency =
+							disabled and math.max(original, 0.45) or original
 					elseif item:IsA("ImageLabel") or item:IsA("ImageButton") then
 						if item:GetAttribute("LunaOriginalImageTransparency") == nil then
-							item:SetAttribute("LunaOriginalImageTransparency", item.ImageTransparency)
+							item:SetAttribute(
+								"LunaOriginalImageTransparency",
+								item.ImageTransparency
+							)
 						end
-						local original = item:GetAttribute("LunaOriginalImageTransparency") or 0
-						item.ImageTransparency = disabled and math.max(original, 0.45) or original
+						local original =
+							item:GetAttribute("LunaOriginalImageTransparency") or 0
+						item.ImageTransparency =
+							disabled and math.max(original, 0.45) or original
 					elseif item:IsA("UIStroke") then
 						if item:GetAttribute("LunaOriginalStrokeTransparency") == nil then
-							item:SetAttribute("LunaOriginalStrokeTransparency", item.Transparency)
+							item:SetAttribute(
+								"LunaOriginalStrokeTransparency",
+								item.Transparency
+							)
 						end
-						local original = item:GetAttribute("LunaOriginalStrokeTransparency") or 0
-						item.Transparency = disabled and math.max(original, 0.7) or original
+						local original =
+							item:GetAttribute("LunaOriginalStrokeTransparency") or 0
+						item.Transparency =
+							disabled and math.max(original, 0.7) or original
 					end
 				end
 			end
@@ -359,7 +612,13 @@ local function EnhanceComponent(component)
 	end
 
 	function component:IsVisible()
-		return self._Object and self._Object.Visible or self.Visible ~= false
+		if self._Destroyed then
+			return false
+		end
+		if self._Object then
+			return self._Object.Visible == true
+		end
+		return self.Visible ~= false
 	end
 
 	if component.Destroy and not component._DestroyWrapped then
@@ -378,7 +637,7 @@ local function EnhanceComponent(component)
 end
 
 function Luna:GetDiagnostics()
-	local connectionCount, componentCount, optionCount = 0, 0, 0
+	local connectionCount, componentCount, optionCount, groupCount = 0, 0, 0, 0
 	for connection in pairs(Luna._Connections) do
 		if typeof(connection) == "RBXScriptConnection" and connection.Connected then
 			connectionCount += 1
@@ -390,6 +649,7 @@ function Luna:GetDiagnostics()
 		if component and not component._Destroyed then componentCount += 1 end
 	end
 	for _ in pairs(Luna.Options) do optionCount += 1 end
+	for _ in pairs(Luna._ToggleGroups) do groupCount += 1 end
 	return {
 		Version = Release,
 		Destroyed = Luna._Destroyed,
@@ -402,7 +662,13 @@ function Luna:GetDiagnostics()
 		NotificationsCreated = Luna._Stats.NotificationsCreated,
 		ActiveNotifications = Luna._Stats.ActiveNotifications,
 		DuplicateFlags = Luna._Stats.DuplicateFlags,
+		ConfigRollbacks = Luna._Stats.ConfigRollbacks,
+		ConfigWarnings = Luna._Stats.ConfigWarnings,
+		ToggleGroups = groupCount,
 		MaxNotifications = Luna.MaxNotifications,
+		NotificationBlurEnabled = Luna.NotificationBlurEnabled,
+		WindowBlurEnabled = Luna.WindowBlurEnabled,
+		StrictConfig = Luna.StrictConfig,
 		ConfigVersion = Luna.ConfigVersion,
 	}
 end
@@ -2197,10 +2463,13 @@ local function UnpackColor(Color)
 	return Color3.fromRGB(Color.R, Color.G, Color.B)
 end
 
-function tween(object, goal, callback, tweenin)
-	local tween = TweenService:Create(object,tweenin or tweeninfo, goal)
-	tween.Completed:Connect(callback or function() end)
-	tween:Play()
+local function tween(object, goal, callback, tweenin)
+	local animation = TweenService:Create(object, tweenin or tweeninfo, goal)
+	if type(callback) == "function" then
+		animation.Completed:Once(callback)
+	end
+	animation:Play()
+	return animation
 end
 
 local function BlurModule(Frame)
@@ -2347,10 +2616,26 @@ local function BlurModule(Frame)
 	end
 
 	local function UpdateOrientation(fetchProps)
+		if not Frame.Parent or Frame.Visible == false then
+			for _, pt in pairs(parts) do
+				pt.Transparency = 1
+			end
+			return
+		end
+
+		camera = GetCurrentCamera()
+		if not camera then return end
+		if root.Parent ~= camera then
+			root.Parent = camera
+		end
+
 		local properties = {
 			Transparency = 0.98;
 			BrickColor = BrickColor.new('Institutional white');
 		}
+		for _, pt in pairs(parts) do
+			pt.Transparency = properties.Transparency
+		end
 		local zIndex = 1 - 0.05*frame.ZIndex
 
 		local tl, br = frame.AbsolutePosition, frame.AbsolutePosition + frame.AbsoluteSize
@@ -2392,12 +2677,14 @@ local function BlurModule(Frame)
 
 	UpdateOrientation(true)
 	RunService:BindToRenderStep(uid, 2000, UpdateOrientation)
+	Luna._Stats.RenderLoops += 1
 
 	local cleaned = false
 	local function CleanupBlur()
 		if cleaned then return end
 		cleaned = true
 		pcall(function() RunService:UnbindFromRenderStep(uid) end)
+		Luna._Stats.RenderLoops = math.max(0, Luna._Stats.RenderLoops - 1)
 		pcall(function() frame:Destroy() end)
 		pcall(function() f:Destroy() end)
 		pcall(function() root:Destroy() end)
@@ -2426,7 +2713,28 @@ local function unpackt(array : table)
 end
 
 -- Interface Management
-local LunaUI = game:GetObjects("rbxassetid://86467455075715")[1]
+local assetSuccess, assetObjects = pcall(
+	game.GetObjects,
+	game,
+	"rbxassetid://86467455075715"
+)
+if not assetSuccess
+	or type(assetObjects) ~= "table"
+	or not assetObjects[1]
+then
+	error("Luna UI asset could not be loaded: " .. tostring(assetObjects))
+end
+
+local LunaUI = assetObjects[1]
+local requiredChildren = {"SmartWindow", "Notifications", "Drag", "MobileSupport"}
+for _, childName in ipairs(requiredChildren) do
+	if not LunaUI:FindFirstChild(childName) then
+		pcall(function() LunaUI:Destroy() end)
+		error(("Luna UI asset is missing required child %q."):format(childName))
+	end
+end
+
+GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = Luna
 
 local SavedWindowVisibilityState = setmetatable({}, {__mode = "k"})
 local LastHideNotificationAt = setmetatable({}, {__mode = "k"})
@@ -2523,21 +2831,13 @@ else
 	LunaUI.Parent = CoreGui
 end
 
-if gethui then
-	for _, Interface in ipairs(gethui():GetChildren()) do
-		if Interface.Name == LunaUI.Name and Interface ~= LunaUI then
-			Hide(Interface.SmartWindow)
+local interfaceParent = type(gethui) == "function" and gethui() or CoreGui
+for _, Interface in ipairs(interfaceParent:GetChildren()) do
+	if Interface.Name == LunaUI.Name and Interface ~= LunaUI then
+		pcall(function()
 			Interface.Enabled = false
-			Interface.Name = "Luna-Old"
-		end
-	end
-else
-	for _, Interface in ipairs(CoreGui:GetChildren()) do
-		if Interface.Name == LunaUI.Name and Interface ~= LunaUI then
-			Hide(Interface.SmartWindow)
-			Interface.Enabled = false
-			Interface.Name = "Luna-Old"
-		end
+			Interface:Destroy()
+		end)
 	end
 end
 
@@ -2556,6 +2856,27 @@ local LoadingFrame = Main.LoadingFrame
 local Navigation = Main.Navigation
 local Tabs = Navigation.Tabs
 local Notifications = LunaUI.Notifications
+
+function Luna:SetTheme(theme)
+	theme = type(theme) == "table" and theme or {}
+	local color1 = theme.Color1 or theme[1]
+	local color2 = theme.Color2 or theme[2]
+	local color3 = theme.Color3 or theme[3]
+	if typeof(color1) ~= "Color3"
+		or typeof(color2) ~= "Color3"
+		or typeof(color3) ~= "Color3"
+	then
+		return false, "Theme requires three Color3 values."
+	end
+	Luna.ThemeGradient = ColorSequence.new({
+		ColorSequenceKeypoint.new(0.00, color1),
+		ColorSequenceKeypoint.new(0.50, color2),
+		ColorSequenceKeypoint.new(1.00, color3),
+	})
+	LunaUI.ThemeRemote.Value = not LunaUI.ThemeRemote.Value
+	return true
+end
+
 local LegacyKeyGate = Main:FindFirstChild("KeySystem")
 if LegacyKeyGate then
 	LegacyKeyGate:Destroy()
@@ -2617,7 +2938,7 @@ local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 		if inputEndedConnection then
 			pcall(function() inputEndedConnection:Disconnect() end)
 		end
-		inputEndedConnection = input.Changed:Connect(function()
+		inputEndedConnection = TrackConnection(input.Changed:Connect(function()
 			if input.UserInputState == Enum.UserInputState.End then
 				Dragging = false
 				if enableTaptic and dragBarCosmetic then
@@ -2627,8 +2948,7 @@ local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 					}):Play()
 				end
 			end
-		end)
-		TrackConnection(inputEndedConnection, connections)
+		end), connections)
 	end), connections)
 
 	TrackConnection(Bar.InputChanged:Connect(function(input)
@@ -2736,6 +3056,21 @@ function Luna:SetMaxNotifications(value)
 	return maximum
 end
 
+function Luna:SetStrictConfig(enabled)
+	Luna.StrictConfig = enabled == true
+	return Luna.StrictConfig
+end
+
+function Luna:SetNotificationBlurEnabled(enabled)
+	Luna.NotificationBlurEnabled = enabled == true
+	return Luna.NotificationBlurEnabled
+end
+
+function Luna:SetWindowBlurEnabled(enabled)
+	Luna.WindowBlurEnabled = enabled ~= false
+	return Luna.WindowBlurEnabled
+end
+
 function Luna:ClearNotifications()
 	while #Luna._NotificationQueue > 0 do
 		CloseNotificationRecord(Luna._NotificationQueue[1], true)
@@ -2756,6 +3091,7 @@ function Luna:Notification(data) -- action e.g open messages
 			Icon = "view_in_ar",
 			ImageSource = "Material",
 			Duration = nil,
+			Blur = Luna.NotificationBlurEnabled,
 		}, data or {})
 
 		local maximum = math.max(
@@ -2778,7 +3114,7 @@ function Luna:Notification(data) -- action e.g open messages
 		local record = {
 			Object = newNotification,
 			Closed = false,
-			CleanupBlur = BlurModule(newNotification),
+			CleanupBlur = data.Blur == true and BlurModule(newNotification) or nil,
 		}
 		table.insert(Luna._NotificationQueue, record)
 		Luna._Stats.ActiveNotifications = #Luna._NotificationQueue
@@ -2931,14 +3267,27 @@ local function Unhide(Window, currentTab)
 end
 
 local MainSize
-local MinSize 
-if Camera.ViewportSize.X > 774 and Camera.ViewportSize.Y > 503 then
-	MainSize = UDim2.fromOffset(675, 424)
-	MinSize = UDim2.fromOffset(500, 42)
-else
-	MainSize = UDim2.fromOffset(Camera.ViewportSize.X - 100, Camera.ViewportSize.Y - 100)
-	MinSize = UDim2.fromOffset(Camera.ViewportSize.X - 275, 42)
+local MinSize
+
+local function CalculateWindowSizes()
+	local currentCamera = GetCurrentCamera()
+	local viewport = currentCamera and currentCamera.ViewportSize
+		or Vector2.new(800, 600)
+
+	if viewport.X > 774 and viewport.Y > 503 then
+		MainSize = UDim2.fromOffset(675, 424)
+		MinSize = UDim2.fromOffset(500, 42)
+	else
+		MainSize = UDim2.fromOffset(
+			math.max(320, viewport.X - 40),
+			math.max(260, viewport.Y - 70)
+		)
+		MinSize = UDim2.fromOffset(math.max(260, viewport.X - 160), 42)
+	end
+	return MainSize, MinSize
 end
+
+CalculateWindowSizes()
 
 local function Maximise(Window)
 	Window.Controls.ToggleSize.ImageLabel.Image = "rbxassetid://10137941941"
@@ -2967,6 +3316,7 @@ function Luna:CreateWindow(WindowSettings)
 		LoadingDuration = 1.2,
 		LoadingTitle = "Luna Interface Suite",
 		LoadingSubtitle = "by Nebula Softworks",
+		BlurEnabled = Luna.WindowBlurEnabled,
 
 		ConfigSettings = {},
 		MinimizeSettings = {},
@@ -3071,7 +3421,6 @@ function Luna:CreateWindow(WindowSettings)
 	Main.Visible = true
 	Main.BackgroundTransparency = 1
 	Main.Size = MainSize
-	Main.Size = UDim2.fromOffset(Main.Size.X.Offset - 70, Main.Size.Y.Offset - 55)
 	Main.Parent.ShadowHolder.Size = Main.Size
 	LoadingFrame.Frame.Frame.Title.TextTransparency = 1
 	LoadingFrame.Frame.Frame.Subtitle.TextTransparency = 1
@@ -3093,30 +3442,42 @@ function Luna:CreateWindow(WindowSettings)
 		v.Visible = false
 	end
 
-	Main:GetPropertyChangedSignal("Position"):Connect(function()
-		Main.Parent.ShadowHolder.Position = Main.Position
-	end)
-	Main:GetPropertyChangedSignal("Size"):Connect(function()
-		Main.Parent.ShadowHolder.Size = Main.Size
-	end)
-
-	TrackConnection(Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-		local viewport = Camera.ViewportSize
-		if viewport.X > 774 and viewport.Y > 503 then
-			MainSize = UDim2.fromOffset(675, 424)
-			MinSize = UDim2.fromOffset(500, 42)
-		else
-			MainSize = UDim2.fromOffset(math.max(320, viewport.X - 40), math.max(260, viewport.Y - 70))
-			MinSize = UDim2.fromOffset(math.max(260, viewport.X - 160), 42)
-		end
-		if Main and Main.Parent then
-			if Window.Size then
-				Main.Size = MinSize
-			else
-				Main.Size = MainSize
-			end
+	TrackConnection(Main:GetPropertyChangedSignal("Position"):Connect(function()
+		if Main.Parent and Main.Parent:FindFirstChild("ShadowHolder") then
+			Main.Parent.ShadowHolder.Position = Main.Position
 		end
 	end))
+	TrackConnection(Main:GetPropertyChangedSignal("Size"):Connect(function()
+		if Main.Parent and Main.Parent:FindFirstChild("ShadowHolder") then
+			Main.Parent.ShadowHolder.Size = Main.Size
+		end
+	end))
+
+	local viewportConnection
+	local function ApplyViewportSize()
+		CalculateWindowSizes()
+		if Main and Main.Parent then
+			Main.Size = Window.Size and MinSize or MainSize
+		end
+	end
+	local function BindViewportCamera()
+		if viewportConnection then
+			pcall(function() viewportConnection:Disconnect() end)
+			Luna._Connections[viewportConnection] = nil
+			viewportConnection = nil
+		end
+		Camera = workspace.CurrentCamera or Camera
+		if Camera then
+			viewportConnection = TrackConnection(
+				Camera:GetPropertyChangedSignal("ViewportSize"):Connect(ApplyViewportSize)
+			)
+		end
+		ApplyViewportSize()
+	end
+	TrackConnection(
+		workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(BindViewportCamera)
+	)
+	BindViewportCamera()
 
 	LoadingFrame.Visible = true
 
@@ -3142,7 +3503,9 @@ function Luna:CreateWindow(WindowSettings)
 
 	LunaUI.Enabled = true
 
-	BlurModule(Main)
+	if WindowSettings.BlurEnabled ~= false then
+		BlurModule(Main)
+	end
 
 	if WindowSettings.LoadingEnabled then
 		task.wait(0.3)
@@ -3904,9 +4267,9 @@ function Luna:CreateWindow(WindowSettings)
 
 		task.wait(0.01)
 
-		TabButton.Interact.MouseButton1Click:Connect(function()
+		TrackConnection(TabButton.Interact.MouseButton1Click:Connect(function()
 			Tab:Activate()
-		end)
+		end))
 
 		FirstTab = false
 
@@ -4003,7 +4366,7 @@ function Luna:CreateWindow(WindowSettings)
 					TweenService:Create(Button.Desc, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
 				end
 
-				Button.Interact["MouseButton1Click"]:Connect(function()
+				ConnectComponent(ButtonV, Button.Interact.MouseButton1Click, function()
 					local Success,Response = pcall(ButtonSettings.Callback)
 
 					if not Success then
@@ -4028,12 +4391,12 @@ function Luna:CreateWindow(WindowSettings)
 					end
 				end)
 
-				Button["MouseEnter"]:Connect(function()
+				ConnectComponent(ButtonV, Button.MouseEnter, function()
 					ButtonV.Hover = true
 					tween(Button.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 				end)
 
-				Button["MouseLeave"]:Connect(function()
+				ConnectComponent(ButtonV, Button.MouseLeave, function()
 					ButtonV.Hover = false
 					tween(Button.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 				end)
@@ -4189,7 +4552,6 @@ function Luna:CreateWindow(WindowSettings)
 			function Section:CreateSlider(SliderSettings, Flag)
 				TabPage.Position = UDim2.new(0,0,0,28)
 				local SliderV = {IgnoreConfig = false, Class = "Slider", Settings = SliderSettings}
-				local SliderConnections = {}
 
 				SliderSettings = Kwargify({
 					Name = "Slider",
@@ -4198,8 +4560,11 @@ function Luna:CreateWindow(WindowSettings)
 					CurrentValue = 100,
 					FireOnInit = false,
 					FireOnSet = true,
+					CallbackInterval = 0.03,
 					Callback = function(Value) end,
+					OnFinished = function(Value) end,
 				}, SliderSettings or {})
+				SliderV.Settings = SliderSettings
 
 				local Slider = Elements.Template.Slider:Clone()
 				Slider.Name = tostring(SliderSettings.Name) .. " - Slider"
@@ -4217,9 +4582,11 @@ function Luna:CreateWindow(WindowSettings)
 				local updatingText = false
 				local dragging = false
 				local activeInput
+				local lastCallbackAt = -math.huge
 
 				local function normalizedRange()
-					local range = type(SliderSettings.Range) == "table" and SliderSettings.Range or {0, 100}
+					local range = type(SliderSettings.Range) == "table"
+						and SliderSettings.Range or {0, 100}
 					local minimum = tonumber(range[1]) or 0
 					local maximum = tonumber(range[2]) or 100
 					if minimum > maximum then minimum, maximum = maximum, minimum end
@@ -4228,21 +4595,42 @@ function Luna:CreateWindow(WindowSettings)
 					return minimum, maximum, increment
 				end
 
+				local function decimalPlaces(number)
+					local output = string.format("%.6f", math.abs(tonumber(number) or 0))
+					output = output:gsub("0+$", ""):gsub("%.$", "")
+					local decimals = output:match("%.(%d+)$")
+					return decimals and #decimals or 0
+				end
+
 				local function formatNumber(value, increment)
-					if increment >= 1 then return tostring(math.floor(value + 0.5)) end
-					local decimals = math.clamp(math.ceil(-math.log10(increment)), 0, 6)
+					local decimals = math.clamp(decimalPlaces(increment), 0, 6)
 					local output = string.format("%." .. decimals .. "f", value)
-					return output:gsub("(%..-)0+$", "%1"):gsub("%.$", "")
+					if decimals > 0 then
+						output = output:gsub("(%..-)0+$", "%1"):gsub("%.$", "")
+					end
+					return output
 				end
 
 				local function setProgress(value)
 					local minimum, maximum = normalizedRange()
 					local width = math.max(0, Slider.Main.AbsoluteSize.X)
-					local alpha = maximum == minimum and 0 or math.clamp((value - minimum) / (maximum - minimum), 0, 1)
+					local alpha = maximum == minimum and 0
+						or math.clamp((value - minimum) / (maximum - minimum), 0, 1)
 					Slider.Main.Progress.Size = UDim2.new(0, math.max(5, width * alpha), 1, 0)
 				end
 
-				local function setValue(value, fireCallback)
+				local function emitCallback(value, force)
+					local interval = math.max(0, tonumber(SliderSettings.CallbackInterval) or 0.03)
+					local now = os.clock()
+					if force == true or now - lastCallbackAt >= interval then
+						lastCallbackAt = now
+						SafeCall(SliderSettings.Callback, value)
+						return true
+					end
+					return false
+				end
+
+				local function setValue(value, fireCallback, forceCallback)
 					local minimum, maximum, increment = normalizedRange()
 					value = tonumber(value) or tonumber(SliderSettings.CurrentValue) or minimum
 					value = math.clamp(value, minimum, maximum)
@@ -4259,14 +4647,18 @@ function Luna:CreateWindow(WindowSettings)
 					updatingText = false
 					setProgress(value)
 
-					if fireCallback and changed and IsComponentUsable(SliderV) then
-						SafeCall(SliderSettings.Callback, value)
+					if fireCallback and (changed or forceCallback == true)
+						and IsComponentUsable(SliderV)
+					then
+						emitCallback(value, forceCallback == true)
 					end
 					return value
 				end
 
 				local function inputX(input)
-					if input and input.UserInputType == Enum.UserInputType.Touch then return input.Position.X end
+					if input and input.UserInputType == Enum.UserInputType.Touch then
+						return input.Position.X
+					end
 					return UserInputService:GetMouseLocation().X
 				end
 
@@ -4275,19 +4667,27 @@ function Luna:CreateWindow(WindowSettings)
 					local width = Slider.Main.AbsoluteSize.X
 					if width <= 0 then return end
 					local minimum, maximum = normalizedRange()
-					local alpha = math.clamp((inputX(input) - Slider.Main.AbsolutePosition.X) / width, 0, 1)
-					setValue(minimum + alpha * (maximum - minimum), true)
+					local alpha = math.clamp(
+						(inputX(input) - Slider.Main.AbsolutePosition.X) / width,
+						0,
+						1
+					)
+					setValue(minimum + alpha * (maximum - minimum), true, false)
 				end
 
 				ConnectComponent(SliderV, Slider.MouseEnter, function()
-					if not SliderV.Disabled then tween(Slider.UIStroke, {Color = Color3.fromRGB(87, 84, 104)}) end
+					if not SliderV.Disabled then
+						tween(Slider.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+					end
 				end)
 				ConnectComponent(SliderV, Slider.MouseLeave, function()
 					tween(Slider.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 				end)
 				ConnectComponent(SliderV, Slider.Interact.InputBegan, function(input)
 					if not IsComponentUsable(SliderV) then return end
-					if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					if input.UserInputType == Enum.UserInputType.MouseButton1
+						or input.UserInputType == Enum.UserInputType.Touch
+					then
 						dragging = true
 						activeInput = input
 						updateFromInput(input)
@@ -4303,16 +4703,24 @@ function Luna:CreateWindow(WindowSettings)
 					updateFromInput(input)
 				end)
 				ConnectComponent(SliderV, UserInputService.InputEnded, function(input)
-					if input == activeInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+					if input == activeInput
+						or input.UserInputType == Enum.UserInputType.MouseButton1
+					then
+						local wasDragging = dragging
 						dragging = false
 						activeInput = nil
+						if wasDragging and IsComponentUsable(SliderV) then
+							setValue(SliderV.CurrentValue, true, true)
+							SafeCall(SliderSettings.OnFinished, SliderV.CurrentValue)
+						end
 					end
 				end)
 
 				if Slider.Value:IsA("TextBox") then
 					ConnectComponent(SliderV, Slider.Value.FocusLost, function()
 						if updatingText then return end
-						setValue(Slider.Value.Text, true)
+						setValue(Slider.Value.Text, true, true)
+						SafeCall(SliderSettings.OnFinished, SliderV.CurrentValue)
 					end)
 				end
 
@@ -4324,7 +4732,8 @@ function Luna:CreateWindow(WindowSettings)
 				end)
 
 				function SliderV:UpdateValue(value, silent)
-					return setValue(value, silent ~= true)
+					setValue(value, silent ~= true, false)
+					return self
 				end
 
 				function SliderV:Set(NewSliderSettings)
@@ -4333,9 +4742,14 @@ function Luna:CreateWindow(WindowSettings)
 					SliderV.Settings = NewSliderSettings
 					Slider.Name = tostring(SliderSettings.Name) .. " - Slider"
 					Slider.Title.Text = tostring(SliderSettings.Name)
-					local shouldFire = NewSliderSettings.Silent ~= true and SliderSettings.FireOnSet ~= false
-					setValue(SliderSettings.CurrentValue, shouldFire)
-					return SliderV
+					local shouldFire = NewSliderSettings.Silent ~= true
+						and SliderSettings.FireOnSet ~= false
+					setValue(
+						SliderSettings.CurrentValue,
+						shouldFire,
+						NewSliderSettings.ForceCallback == true
+					)
+					return self
 				end
 
 				function SliderV:Destroy()
@@ -4346,16 +4760,19 @@ function Luna:CreateWindow(WindowSettings)
 				if Flag then RegisterOption(Flag, SliderV) end
 				SliderV._Object = Slider
 				SliderV = EnhanceComponent(SliderV)
-				setValue(SliderSettings.CurrentValue, false)
-				if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then SafeCall(SliderSettings.Callback, SliderV.CurrentValue) end
+				setValue(SliderSettings.CurrentValue, false, false)
+				if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then
+					emitCallback(SliderV.CurrentValue, true)
+				end
 				task.defer(function()
-					if Slider.Parent then setProgress(tonumber(SliderSettings.CurrentValue) or 0) end
+					if Slider.Parent then
+						setProgress(tonumber(SliderSettings.CurrentValue) or 0)
+					end
 				end)
 				return SliderV
 			end
-
 			-- Toggle
-			function Section:CreateToggle(ToggleSettings, Flag)    
+			function Section:CreateToggle(ToggleSettings, Flag)
 				TabPage.Position = UDim2.new(0,0,0,28)
 				local ToggleV = { IgnoreConfig = false, Class = "Toggle" }
 
@@ -4364,13 +4781,16 @@ function Luna:CreateWindow(WindowSettings)
 					Description = nil,
 					CurrentValue = false,
 					FireOnInit = false,
-					Callback = function(Value)
-					end,
+					FireOnSet = true,
+					Group = nil,
+					AllowNone = true,
+					FireGroupCallbacks = true,
+					Callback = function(Value) end,
 				}, ToggleSettings or {})
 
+				ToggleV.Settings = ToggleSettings
 
 				local Toggle
-
 				if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" then
 					Toggle = Elements.Template.ToggleDesc:Clone()
 				else
@@ -4379,11 +4799,10 @@ function Luna:CreateWindow(WindowSettings)
 
 				Toggle.Visible = true
 				Toggle.Parent = TabPage
-
-				Toggle.Name = ToggleSettings.Name .. " - Toggle"
-				Toggle.Title.Text = ToggleSettings.Name
+				Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
+				Toggle.Title.Text = tostring(ToggleSettings.Name)
 				if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" then
-					Toggle.Desc.Text = ToggleSettings.Description
+					Toggle.Desc.Text = tostring(ToggleSettings.Description)
 				end
 
 				Toggle.UIStroke.Transparency = 1
@@ -4397,128 +4816,203 @@ function Luna:CreateWindow(WindowSettings)
 					TweenService:Create(Toggle.Desc, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 				end
 				TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-				TweenService:Create(Toggle.Title, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
+				TweenService:Create(Toggle.Title, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 
-				local function Set(bool)
-					if bool then
+				local function Render(state)
+					state = state == true
+					if state then
 						Toggle.toggle.color.Enabled = true
 						tween(Toggle.toggle, {BackgroundTransparency = 0})
-
 						Toggle.toggle.UIStroke.color.Enabled = true
-						tween(Toggle.toggle.UIStroke, {Color = Color3.new(255,255,255)})
-
-						tween(Toggle.toggle.val, {BackgroundColor3 = Color3.fromRGB(255,255,255), Position = UDim2.new(1,-23,0.5,0), BackgroundTransparency = 0.45})
+						tween(Toggle.toggle.UIStroke, {Color = Color3.fromRGB(255,255,255)})
+						tween(Toggle.toggle.val, {
+							BackgroundColor3 = Color3.fromRGB(255,255,255),
+							Position = UDim2.new(1,-23,0.5,0),
+							BackgroundTransparency = 0.45,
+						})
 					else
 						Toggle.toggle.color.Enabled = false
 						Toggle.toggle.UIStroke.color.Enabled = false
-
 						Toggle.toggle.UIStroke.Color = Color3.fromRGB(97,97,97)
-
 						tween(Toggle.toggle, {BackgroundTransparency = 1})
-
-						tween(Toggle.toggle.val, {BackgroundColor3 = Color3.fromRGB(97,97,97), Position = UDim2.new(0,5,0.5,0), BackgroundTransparency = 0})
+						tween(Toggle.toggle.val, {
+							BackgroundColor3 = Color3.fromRGB(97,97,97),
+							Position = UDim2.new(0,5,0.5,0),
+							BackgroundTransparency = 0,
+						})
 					end
-
-					ToggleV.CurrentValue = bool
 				end
 
-				Toggle.Interact.MouseButton1Click:Connect(function()
-					ToggleSettings.CurrentValue = not ToggleSettings.CurrentValue
-					Set(ToggleSettings.CurrentValue)
-
-					local Success, Response = pcall(function()
-						ToggleSettings.Callback(ToggleSettings.CurrentValue)
-					end)
-					if not Success then
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-						Toggle.Title.Text = "Callback Error"
-						print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
-						Toggle.Title.Text = ToggleSettings.Name
+				local function ShowCallbackError(response)
+					if not Toggle.Parent then return end
+					Luna._Stats.CallbackErrors += 1
+					warn("Luna UI callback error: " .. tostring(response))
+					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
+					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
+					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
+					Toggle.Title.Text = "Callback Error"
+					task.delay(0.5, function()
+						if not Toggle.Parent then return end
+						Toggle.Title.Text = tostring(ToggleSettings.Name)
 						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
 						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
+					end)
+				end
+
+				local function EmitCallback(state)
+					if not IsComponentUsable(ToggleV) then return false end
+					local success, response = pcall(ToggleSettings.Callback, state)
+					if not success then
+						ShowCallbackError(response)
+					end
+					return success, response
+				end
+
+				local function SetRawState(state)
+					state = state == true
+					ToggleSettings.CurrentValue = state
+					ToggleV.CurrentValue = state
+					Render(state)
+					return state
+				end
+
+				local function ApplyState(state, fireCallback, enforceGroup, fireGroupCallbacks, force)
+					state = state == true
+					force = force == true
+					local group = ToggleV._ToggleGroup
+
+					if group and Luna._MutatingToggleGroups[group] and not force then
+						return ToggleV, false, "Toggle group is busy."
+					end
+
+					if not state
+						and group
+						and enforceGroup ~= false
+						and not force
+						and not ToggleGroupAllowsNone(group)
+						and not ToggleGroupHasOtherActive(ToggleV)
+					then
+						return ToggleV, false, "At least one toggle in this group must remain active."
+					end
+
+					if state and group and enforceGroup ~= false then
+						if not BeginToggleGroupMutation(group) then
+							return ToggleV, false, "Toggle group is busy."
+						end
+
+						local deactivated = DeactivateToggleGroup(ToggleV)
+						SetRawState(true)
+
+						if fireGroupCallbacks == true then
+							for _, member in ipairs(deactivated) do
+								if type(member._EmitExclusiveCallback) == "function" then
+									member:_EmitExclusiveCallback(false)
+								end
+							end
+						end
+						if fireCallback == true then
+							EmitCallback(true)
+						end
+						EndToggleGroupMutation(group)
+					else
+						SetRawState(state)
+						if fireCallback == true then
+							EmitCallback(state)
+						end
+					end
+					return ToggleV, true
+				end
+
+				function ToggleV:_ApplyExclusiveState(state, fireCallback)
+					SetRawState(state)
+					if fireCallback == true then
+						EmitCallback(state == true)
+					end
+					return self
+				end
+
+				function ToggleV:_EmitExclusiveCallback(state)
+					return EmitCallback(state == true)
+				end
+
+				function ToggleV:GetGroup()
+					return self._ToggleGroup
+				end
+
+				function ToggleV:SetGroup(group, fireGroupCallbacks)
+					ToggleSettings.Group = group
+					RegisterToggleGroup(self, group)
+					if self.CurrentValue == true and self._ToggleGroup then
+						ApplyState(true, false, true, fireGroupCallbacks == true, true)
+					end
+					NormalizeAllToggleGroups(false)
+					return self
+				end
+
+				ConnectComponent(ToggleV, Toggle.Interact.MouseButton1Click, function()
+					if not IsComponentUsable(ToggleV) then return end
+					ApplyState(
+						not ToggleSettings.CurrentValue,
+						true,
+						true,
+						ToggleSettings.FireGroupCallbacks ~= false,
+						false
+					)
+				end)
+
+				ConnectComponent(ToggleV, Toggle.MouseEnter, function()
+					if not ToggleV.Disabled then
+						tween(Toggle.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 					end
 				end)
 
-				Toggle["MouseEnter"]:Connect(function()
-					tween(Toggle.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
-				end)
-
-				Toggle["MouseLeave"]:Connect(function()
+				ConnectComponent(ToggleV, Toggle.MouseLeave, function()
 					tween(Toggle.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 				end)
 
-				if ToggleSettings.CurrentValue then
-					Set(ToggleSettings.CurrentValue)
-					local Success, Response = true, nil
-					if ToggleSettings.FireOnInit then Success, Response = pcall(function()
-						ToggleSettings.Callback(ToggleSettings.CurrentValue)
-					end) end
-					if not Success then
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-						Toggle.Title.Text = "Callback Error"
-						print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
-						Toggle.Title.Text = ToggleSettings.Name
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-					end
-				end
-
-				function ToggleV:UpdateState(State)
-					ToggleSettings.CurrentValue = State
-					Set(ToggleSettings.CurrentValue)
+				function ToggleV:UpdateState(state, force)
+					return ApplyState(state, false, true, false, force == true)
 				end
 
 				function ToggleV:Set(NewToggleSettings)
-
 					NewToggleSettings = Kwargify({
 						Name = ToggleSettings.Name,
 						Description = ToggleSettings.Description,
 						CurrentValue = ToggleSettings.CurrentValue,
-						Callback = ToggleSettings.Callback
+						FireOnInit = ToggleSettings.FireOnInit,
+						FireOnSet = ToggleSettings.FireOnSet,
+						Group = ToggleSettings.Group,
+						AllowNone = ToggleSettings.AllowNone,
+						FireGroupCallbacks = ToggleSettings.FireGroupCallbacks,
+						Callback = ToggleSettings.Callback,
 					}, NewToggleSettings or {})
 
-					ToggleV.Settings = NewToggleSettings
 					ToggleSettings = NewToggleSettings
+					ToggleV.Settings = NewToggleSettings
+					RegisterToggleGroup(ToggleV, ToggleSettings.Group)
 
-					Toggle.Name = ToggleSettings.Name .. " - Toggle"
-					Toggle.Title.Text = ToggleSettings.Name
-					if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" and Toggle.Desc ~= nil then
-						Toggle.Desc.Text = ToggleSettings.Description
+					Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
+					Toggle.Title.Text = tostring(ToggleSettings.Name)
+					if Toggle.Desc ~= nil then
+						Toggle.Desc.Text = tostring(ToggleSettings.Description or "")
 					end
 
-					Set(ToggleSettings.CurrentValue)
-
-					ToggleV.CurrentValue = ToggleSettings.CurrentValue
-
-					local Success, Response = pcall(function()
-						ToggleSettings.Callback(ToggleSettings.CurrentValue)
-					end)
-					if not Success then
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0}):Play()
-						Toggle.Title.Text = "Callback Error"
-						print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
-						Toggle.Title.Text = ToggleSettings.Name
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-						TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-					end
+					local shouldFire = NewToggleSettings.Silent ~= true
+						and ToggleSettings.FireOnSet ~= false
+					return ApplyState(
+						ToggleSettings.CurrentValue,
+						shouldFire,
+						true,
+						shouldFire and ToggleSettings.FireGroupCallbacks ~= false,
+						NewToggleSettings.Force == true
+					)
 				end
 
 				function ToggleV:Destroy()
+					RemoveToggleFromGroup(ToggleV)
 					RemoveOption(ToggleV)
-					Toggle.Visible = false
-					Toggle:Destroy()
+					if Toggle.Parent then Toggle:Destroy() end
 				end
 
 				ConnectComponent(ToggleV, LunaUI.ThemeRemote:GetPropertyChangedSignal("Value"), function()
@@ -4528,16 +5022,25 @@ function Luna:CreateWindow(WindowSettings)
 					end
 				end)
 
-				if Flag then
-					RegisterOption(Flag, ToggleV)
-				end
-
+				if Flag then RegisterOption(Flag, ToggleV) end
 				ToggleV._Object = Toggle
+				ToggleV = EnhanceComponent(ToggleV)
+				RegisterToggleGroup(ToggleV, ToggleSettings.Group)
 
-				return EnhanceComponent(ToggleV)
-
+				ApplyState(
+					ToggleSettings.CurrentValue,
+					ToggleSettings.CurrentValue == true and ToggleSettings.FireOnInit == true,
+					true,
+					false,
+					true
+				)
+				task.defer(function()
+					if not ToggleV._Destroyed then
+						NormalizeAllToggleGroups(false)
+					end
+				end)
+				return ToggleV
 			end
-
 			-- Bind
 			function Section:CreateBind(BindSettings, Flag)
 				TabPage.Position = UDim2.new(0,0,0,28)
@@ -4690,165 +5193,176 @@ function Luna:CreateWindow(WindowSettings)
 					PlaceholderText = "Input Placeholder",
 					RemoveTextAfterFocusLost = false,
 					Numeric = false,
+					AllowNegative = true,
+					AllowDecimal = true,
 					Enter = false,
 					MaxCharacters = nil,
-					Callback = function(Text)
-
-					end, -- 52
+					FireOnInit = false,
+					FireOnSet = true,
+					Callback = function(Text) end,
 				}, InputSettings or {})
 
-				InputV.CurrentValue = InputSettings.CurrentValue
+				InputV.Settings = InputSettings
+				local descriptionEnabled = InputSettings.Description ~= nil
+					and InputSettings.Description ~= ""
+				local Input = descriptionEnabled
+					and Elements.Template.InputDesc:Clone()
+					or Elements.Template.Input:Clone()
+				local TextBox = Input.InputFrame.InputBox
 
-				local descriptionbool
-				if InputSettings.Description ~= nil and InputSettings.Description ~= "" then
-					descriptionbool = true
+				Input.Name = tostring(InputSettings.Name)
+				Input.Title.Text = tostring(InputSettings.Name)
+				if descriptionEnabled and Input:FindFirstChild("Desc") then
+					Input.Desc.Text = tostring(InputSettings.Description)
 				end
-
-				local Input 
-				if descriptionbool then
-					Input = Elements.Template.InputDesc:Clone()
-				else
-					Input = Elements.Template.Input:Clone()
-				end
-
-				Input.Name = InputSettings.Name
-				Input.Title.Text = InputSettings.Name
-				if descriptionbool then Input.Desc.Text = InputSettings.Description end
 				Input.Visible = true
 				Input.Parent = TabPage
 
 				Input.BackgroundTransparency = 1
 				Input.UIStroke.Transparency = 1
 				Input.Title.TextTransparency = 1
-				if descriptionbool then Input.Desc.TextTransparency = 1 end
+				if descriptionEnabled and Input:FindFirstChild("Desc") then
+					Input.Desc.TextTransparency = 1
+				end
 				Input.InputFrame.BackgroundTransparency = 1
 				Input.InputFrame.UIStroke.Transparency = 1
-				Input.InputFrame.InputBox.TextTransparency = 1
+				TextBox.TextTransparency = 1
 
 				TweenService:Create(Input, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 				TweenService:Create(Input.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-				TweenService:Create(Input.Title, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
-				if descriptionbool then TweenService:Create(Input.Desc, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play() end
+				TweenService:Create(Input.Title, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+				if descriptionEnabled and Input:FindFirstChild("Desc") then
+					TweenService:Create(Input.Desc, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+				end
 				TweenService:Create(Input.InputFrame, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.9}):Play()
 				TweenService:Create(Input.InputFrame.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 0.3}):Play()
-				TweenService:Create(Input.InputFrame.InputBox, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+				TweenService:Create(TextBox, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 
-				Input.InputFrame.InputBox.PlaceholderText = InputSettings.PlaceholderText
-				Input.InputFrame.Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 30)
+				local updatingText = false
 
-				Input.InputFrame.InputBox.FocusLost:Connect(function(bleh)
-
-					if InputSettings.Enter then
-						if bleh then
-							local Success, Response = pcall(function()
-								InputSettings.Callback(Input.InputFrame.InputBox.Text)
-								InputV.CurrentValue = Input.InputFrame.InputBox.Text
-							end)
-							if not Success then
-								TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-								TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-								TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-								Input.Title.Text = "Callback Error"
-								print("Luna Interface Suite | "..InputSettings.Name.." Callback Error " ..tostring(Response))
-								wait(0.5)
-								Input.Title.Text = InputSettings.Name
-								TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-								TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-								TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-							end
+				local function sanitizeNumeric(text)
+					text = tostring(text or "")
+					local negative = InputSettings.AllowNegative ~= false
+						and text:sub(1, 1) == "-"
+					local body = text:gsub("[^%d%.]", "")
+					if InputSettings.AllowDecimal == false then
+						body = body:gsub("%.", "")
+					else
+						local firstDot = body:find(".", 1, true)
+						if firstDot then
+							body = body:sub(1, firstDot)
+								.. body:sub(firstDot + 1):gsub("%.", "")
 						end
 					end
-
-					if InputSettings.RemoveTextAfterFocusLost then
-						Input.InputFrame.InputBox.Text = ""
-					end
-
-				end)
-
-				if InputSettings.Numeric then
-					Input.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
-						local text = Input.InputFrame.InputBox.Text
-						if not tonumber(text) and text ~= "." then
-							Input.InputFrame.InputBox.Text = text:match("[0-9.]*") or ""
-						end
-					end)
+					return (negative and "-" or "") .. body
 				end
 
-				Input.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
-					if tonumber(InputSettings.MaxCharacters) then
-						if (#Input.InputFrame.InputBox.Text - 1) == InputSettings.MaxCharacters then
-							Input.InputFrame.InputBox.Text = Input.InputFrame.InputBox.Text:sub(1, InputSettings.MaxCharacters)
+				local function sanitizeText(value)
+					local text = tostring(value or "")
+					if InputSettings.Numeric then
+						text = sanitizeNumeric(text)
+					end
+					local maximum = tonumber(InputSettings.MaxCharacters)
+					if maximum then
+						maximum = math.max(0, math.floor(maximum))
+						if #text > maximum then
+							text = text:sub(1, maximum)
 						end
 					end
-					TweenService:Create(Input.InputFrame, TweenInfo.new(0.55, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 30)}):Play()
-					if not InputSettings.Enter then
-						local Success, Response = pcall(function()
-							InputSettings.Callback(Input.InputFrame.InputBox.Text)
-						end)
-						if not Success then
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-							TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-							Input.Title.Text = "Callback Error"
-							print("Luna Interface Suite | "..InputSettings.Name.." Callback Error " ..tostring(Response))
-							wait(0.5)
-							Input.Title.Text = InputSettings.Name
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-							TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-						end
+					return text
+				end
+
+				local function resizeInput()
+					local width = math.clamp(TextBox.TextBounds.X + 52, 90, 320)
+					Input.InputFrame.Size = UDim2.fromOffset(width, 30)
+				end
+
+				local function emitCallback(text)
+					if IsComponentUsable(InputV) then
+						return SafeCall(InputSettings.Callback, text)
 					end
-					InputV.CurrentValue = Input.InputFrame.InputBox.Text				
+					return false
+				end
+
+				local function applyText(value, fireCallback, forceCallback)
+					local text = sanitizeText(value)
+					local changed = tostring(InputV.CurrentValue or "") ~= text
+					InputSettings.CurrentValue = text
+					InputV.CurrentValue = text
+					if TextBox.Text ~= text then
+						updatingText = true
+						TextBox.Text = text
+						updatingText = false
+					end
+					resizeInput()
+					if fireCallback == true and (changed or forceCallback == true) then
+						emitCallback(text)
+					end
+					return text
+				end
+
+				TextBox.PlaceholderText = tostring(InputSettings.PlaceholderText or "")
+				ConnectComponent(InputV, TextBox:GetPropertyChangedSignal("Text"), function()
+					if updatingText or not IsComponentUsable(InputV) then return end
+					applyText(TextBox.Text, not InputSettings.Enter, false)
 				end)
 
-				Input["MouseEnter"]:Connect(function()
-					tween(Input.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+				ConnectComponent(InputV, TextBox.FocusLost, function(enterPressed)
+					local shouldFire = InputSettings.Enter and enterPressed == true
+					applyText(TextBox.Text, shouldFire, shouldFire)
+					if InputSettings.RemoveTextAfterFocusLost then
+						applyText("", false, false)
+					end
 				end)
 
-				Input["MouseLeave"]:Connect(function()
+				ConnectComponent(InputV, Input.MouseEnter, function()
+					if not InputV.Disabled then
+						tween(Input.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+					end
+				end)
+				ConnectComponent(InputV, Input.MouseLeave, function()
 					tween(Input.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 				end)
 
+				function InputV:UpdateValue(value, silent)
+					applyText(value, silent ~= true, false)
+					return self
+				end
 
 				function InputV:Set(NewInputSettings)
-
 					NewInputSettings = Kwargify(InputSettings, NewInputSettings or {})
-
-					InputV.Settings = NewInputSettings
 					InputSettings = NewInputSettings
-
-					Input.Name = InputSettings.Name
-					Input.Title.Text = InputSettings.Name
-					if InputSettings.Description ~= nil and InputSettings.Description ~= "" and Input.Desc ~= nil then
-						Input.Desc.Text = InputSettings.Description
+					InputV.Settings = NewInputSettings
+					Input.Name = tostring(InputSettings.Name)
+					Input.Title.Text = tostring(InputSettings.Name)
+					TextBox.PlaceholderText = tostring(InputSettings.PlaceholderText or "")
+					if Input:FindFirstChild("Desc") then
+						Input.Desc.Text = tostring(InputSettings.Description or "")
 					end
-
-					Input.InputFrame.InputBox:CaptureFocus()
-					Input.InputFrame.InputBox.Text = tostring(InputSettings.CurrentValue)
-					Input.InputFrame.InputBox:ReleaseFocus()
-					Input.InputFrame.Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 42)
-
-					InputV.CurrentValue = InputSettings.CurrentValue
+					local shouldFire = NewInputSettings.Silent ~= true
+						and InputSettings.FireOnSet ~= false
+					applyText(
+						InputSettings.CurrentValue,
+						shouldFire,
+						NewInputSettings.ForceCallback == true
+					)
+					return self
 				end
 
 				function InputV:Destroy()
 					RemoveOption(InputV)
-					Input.Visible = false
-					Input:Destroy()
+					if Input.Parent then Input:Destroy() end
 				end
 
-				if Flag then
-					RegisterOption(Flag, InputV)
-				end
-
-
+				if Flag then RegisterOption(Flag, InputV) end
 				InputV._Object = Input
-
-
-				return EnhanceComponent(InputV)
-
+				InputV = EnhanceComponent(InputV)
+				applyText(InputSettings.CurrentValue, false, false)
+				if InputSettings.FireOnInit then
+					emitCallback(InputV.CurrentValue)
+				end
+				return InputV
 			end
-
 			-- Dropdown
 			function Section:CreateDropdown(DropdownSettings, Flag)
 				TabPage.Position = UDim2.new(0,0,0,28)
@@ -4913,7 +5427,11 @@ function Luna:CreateWindow(WindowSettings)
 					end
 				end
 
-				local function SafeCallback(param, c2)
+				local function SafeCallback(param, c2, silent)
+					if silent == true then
+						if c2 then c2() end
+						return true
+					end
 					local callbackParam = param
 					if DropdownSettings.SpecialType == "Player" and DropdownSettings.ReturnPlayerInstance then
 						if type(param) == "string" then
@@ -4947,7 +5465,7 @@ function Luna:CreateWindow(WindowSettings)
 				end
 
 				-- fixed by justhey
-				Dropdown.Selected:GetPropertyChangedSignal("Text"):Connect(function()
+				ConnectComponent(DropdownV, Dropdown.Selected:GetPropertyChangedSignal("Text"), function()
 					local text = Dropdown.Selected.Text:lower()
 					for _, Item in ipairs(Dropdown.List:GetChildren()) do
 						if Item:IsA("TextLabel") and Item.Name ~= "Template" then
@@ -5072,15 +5590,15 @@ function Luna:CreateWindow(WindowSettings)
 					DropdownV.CurrentOption = DropdownSettings.MultipleOptions and valid or valid[1]
 				end
 
-				Dropdown.Interact.MouseButton1Click:Connect(function()
+				ConnectComponent(DropdownV, Dropdown.Interact.MouseButton1Click, function()
 					Toggle()
 				end)
 
-				Dropdown["MouseEnter"]:Connect(function()
+				ConnectComponent(DropdownV, Dropdown.MouseEnter, function()
 					tween(Dropdown.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 				end)
 
-				Dropdown["MouseLeave"]:Connect(function()
+				ConnectComponent(DropdownV, Dropdown.MouseLeave, function()
 					tween(Dropdown.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 				end)
 
@@ -5186,7 +5704,8 @@ function Luna:CreateWindow(WindowSettings)
 						ind = ind + 1
 					end
 					if ind == 1 then bleh = DropdownSettings.CurrentOption[1] else bleh = DropdownSettings.CurrentOption end
-					SafeCallback(bleh)
+					DropdownV.CurrentOption = DropdownSettings.CurrentOption
+					SafeCallback(bleh, nil, NewDropdownSettings.Silent == true)
 					for _, Option in pairs(Dropdown.List:GetChildren()) do
 						if Option.ClassName == "TextLabel" then
 							tween(Option, {TextColor3 = Color3.fromRGB(200,200,200), BackgroundTransparency = 0.98})
@@ -5216,7 +5735,7 @@ function Luna:CreateWindow(WindowSettings)
 					Dropdown.Selected.Text = ""
 
 					-- Luna.Flags[DropdownSettings.Flag] = DropdownSettings
-
+					return self
 				end
 
 				function DropdownV:Destroy()
@@ -5493,7 +6012,7 @@ function Luna:CreateWindow(WindowSettings)
 				TweenService:Create(Button.Desc, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
 			end
 
-			Button.Interact["MouseButton1Click"]:Connect(function()
+			ConnectComponent(ButtonV, Button.Interact.MouseButton1Click, function()
 				local Success,Response = pcall(ButtonSettings.Callback)
 
 				if not Success then
@@ -5518,12 +6037,12 @@ function Luna:CreateWindow(WindowSettings)
 				end
 			end)
 
-			Button["MouseEnter"]:Connect(function()
+			ConnectComponent(ButtonV, Button.MouseEnter, function()
 				ButtonV.Hover = true
 				tween(Button.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 			end)
 
-			Button["MouseLeave"]:Connect(function()
+			ConnectComponent(ButtonV, Button.MouseLeave, function()
 				ButtonV.Hover = false
 				tween(Button.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 			end)
@@ -5676,7 +6195,6 @@ function Luna:CreateWindow(WindowSettings)
 		-- Slider
 		function Tab:CreateSlider(SliderSettings, Flag)
 			local SliderV = {IgnoreConfig = false, Class = "Slider", Settings = SliderSettings}
-			local SliderConnections = {}
 
 			SliderSettings = Kwargify({
 				Name = "Slider",
@@ -5685,8 +6203,11 @@ function Luna:CreateWindow(WindowSettings)
 				CurrentValue = 100,
 				FireOnInit = false,
 				FireOnSet = true,
+				CallbackInterval = 0.03,
 				Callback = function(Value) end,
+				OnFinished = function(Value) end,
 			}, SliderSettings or {})
+			SliderV.Settings = SliderSettings
 
 			local Slider = Elements.Template.Slider:Clone()
 			Slider.Name = tostring(SliderSettings.Name) .. " - Slider"
@@ -5704,9 +6225,11 @@ function Luna:CreateWindow(WindowSettings)
 			local updatingText = false
 			local dragging = false
 			local activeInput
+			local lastCallbackAt = -math.huge
 
 			local function normalizedRange()
-				local range = type(SliderSettings.Range) == "table" and SliderSettings.Range or {0, 100}
+				local range = type(SliderSettings.Range) == "table"
+					and SliderSettings.Range or {0, 100}
 				local minimum = tonumber(range[1]) or 0
 				local maximum = tonumber(range[2]) or 100
 				if minimum > maximum then minimum, maximum = maximum, minimum end
@@ -5715,26 +6238,42 @@ function Luna:CreateWindow(WindowSettings)
 				return minimum, maximum, increment
 			end
 
+			local function decimalPlaces(number)
+				local output = string.format("%.6f", math.abs(tonumber(number) or 0))
+				output = output:gsub("0+$", ""):gsub("%.$", "")
+				local decimals = output:match("%.(%d+)$")
+				return decimals and #decimals or 0
+			end
+
 			local function formatNumber(value, increment)
-				if increment >= 1 then return tostring(math.floor(value + 0.5)) end
-				local decimals = 0
-				local scale = increment
-				while scale < 1 and decimals < 6 do
-					scale *= 10
-					decimals += 1
-				end
+				local decimals = math.clamp(decimalPlaces(increment), 0, 6)
 				local output = string.format("%." .. decimals .. "f", value)
-				return output:gsub("(%..-)0+$", "%1"):gsub("%.$", "")
+				if decimals > 0 then
+					output = output:gsub("(%..-)0+$", "%1"):gsub("%.$", "")
+				end
+				return output
 			end
 
 			local function setProgress(value)
 				local minimum, maximum = normalizedRange()
 				local width = math.max(0, Slider.Main.AbsoluteSize.X)
-				local alpha = maximum == minimum and 0 or math.clamp((value - minimum) / (maximum - minimum), 0, 1)
+				local alpha = maximum == minimum and 0
+					or math.clamp((value - minimum) / (maximum - minimum), 0, 1)
 				Slider.Main.Progress.Size = UDim2.new(0, math.max(5, width * alpha), 1, 0)
 			end
 
-			local function setValue(value, fireCallback)
+			local function emitCallback(value, force)
+				local interval = math.max(0, tonumber(SliderSettings.CallbackInterval) or 0.03)
+				local now = os.clock()
+				if force == true or now - lastCallbackAt >= interval then
+					lastCallbackAt = now
+					SafeCall(SliderSettings.Callback, value)
+					return true
+				end
+				return false
+			end
+
+			local function setValue(value, fireCallback, forceCallback)
 				local minimum, maximum, increment = normalizedRange()
 				value = tonumber(value) or tonumber(SliderSettings.CurrentValue) or minimum
 				value = math.clamp(value, minimum, maximum)
@@ -5751,14 +6290,18 @@ function Luna:CreateWindow(WindowSettings)
 				updatingText = false
 				setProgress(value)
 
-				if fireCallback and changed and IsComponentUsable(SliderV) then
-					SafeCall(SliderSettings.Callback, value)
+				if fireCallback and (changed or forceCallback == true)
+					and IsComponentUsable(SliderV)
+				then
+					emitCallback(value, forceCallback == true)
 				end
 				return value
 			end
 
 			local function inputX(input)
-				if input and input.UserInputType == Enum.UserInputType.Touch then return input.Position.X end
+				if input and input.UserInputType == Enum.UserInputType.Touch then
+					return input.Position.X
+				end
 				return UserInputService:GetMouseLocation().X
 			end
 
@@ -5767,19 +6310,27 @@ function Luna:CreateWindow(WindowSettings)
 				local width = Slider.Main.AbsoluteSize.X
 				if width <= 0 then return end
 				local minimum, maximum = normalizedRange()
-				local alpha = math.clamp((inputX(input) - Slider.Main.AbsolutePosition.X) / width, 0, 1)
-				setValue(minimum + alpha * (maximum - minimum), true)
+				local alpha = math.clamp(
+					(inputX(input) - Slider.Main.AbsolutePosition.X) / width,
+					0,
+					1
+				)
+				setValue(minimum + alpha * (maximum - minimum), true, false)
 			end
 
 			ConnectComponent(SliderV, Slider.MouseEnter, function()
-				if not SliderV.Disabled then tween(Slider.UIStroke, {Color = Color3.fromRGB(87, 84, 104)}) end
+				if not SliderV.Disabled then
+					tween(Slider.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+				end
 			end)
 			ConnectComponent(SliderV, Slider.MouseLeave, function()
 				tween(Slider.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 			end)
 			ConnectComponent(SliderV, Slider.Interact.InputBegan, function(input)
 				if not IsComponentUsable(SliderV) then return end
-				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				if input.UserInputType == Enum.UserInputType.MouseButton1
+					or input.UserInputType == Enum.UserInputType.Touch
+				then
 					dragging = true
 					activeInput = input
 					updateFromInput(input)
@@ -5795,16 +6346,24 @@ function Luna:CreateWindow(WindowSettings)
 				updateFromInput(input)
 			end)
 			ConnectComponent(SliderV, UserInputService.InputEnded, function(input)
-				if input == activeInput or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				if input == activeInput
+					or input.UserInputType == Enum.UserInputType.MouseButton1
+				then
+					local wasDragging = dragging
 					dragging = false
 					activeInput = nil
+					if wasDragging and IsComponentUsable(SliderV) then
+						setValue(SliderV.CurrentValue, true, true)
+						SafeCall(SliderSettings.OnFinished, SliderV.CurrentValue)
+					end
 				end
 			end)
 
 			if Slider.Value:IsA("TextBox") then
 				ConnectComponent(SliderV, Slider.Value.FocusLost, function()
 					if updatingText then return end
-					setValue(Slider.Value.Text, true)
+					setValue(Slider.Value.Text, true, true)
+					SafeCall(SliderSettings.OnFinished, SliderV.CurrentValue)
 				end)
 			end
 
@@ -5816,7 +6375,8 @@ function Luna:CreateWindow(WindowSettings)
 			end)
 
 			function SliderV:UpdateValue(value, silent)
-				return setValue(value, silent ~= true)
+				setValue(value, silent ~= true, false)
+				return self
 			end
 
 			function SliderV:Set(NewSliderSettings)
@@ -5825,9 +6385,14 @@ function Luna:CreateWindow(WindowSettings)
 				SliderV.Settings = NewSliderSettings
 				Slider.Name = tostring(SliderSettings.Name) .. " - Slider"
 				Slider.Title.Text = tostring(SliderSettings.Name)
-				local shouldFire = NewSliderSettings.Silent ~= true and SliderSettings.FireOnSet ~= false
-				setValue(SliderSettings.CurrentValue, shouldFire)
-				return SliderV
+				local shouldFire = NewSliderSettings.Silent ~= true
+					and SliderSettings.FireOnSet ~= false
+				setValue(
+					SliderSettings.CurrentValue,
+					shouldFire,
+					NewSliderSettings.ForceCallback == true
+				)
+				return self
 			end
 
 			function SliderV:Destroy()
@@ -5838,16 +6403,19 @@ function Luna:CreateWindow(WindowSettings)
 			if Flag then RegisterOption(Flag, SliderV) end
 			SliderV._Object = Slider
 			SliderV = EnhanceComponent(SliderV)
-			setValue(SliderSettings.CurrentValue, false)
-			if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then SafeCall(SliderSettings.Callback, SliderV.CurrentValue) end
+			setValue(SliderSettings.CurrentValue, false, false)
+			if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then
+				emitCallback(SliderV.CurrentValue, true)
+			end
 			task.defer(function()
-				if Slider.Parent then setProgress(tonumber(SliderSettings.CurrentValue) or 0) end
+				if Slider.Parent then
+					setProgress(tonumber(SliderSettings.CurrentValue) or 0)
+				end
 			end)
 			return SliderV
 		end
-
 		-- Toggle
-		function Tab:CreateToggle(ToggleSettings, Flag)    
+		function Tab:CreateToggle(ToggleSettings, Flag)
 			local ToggleV = { IgnoreConfig = false, Class = "Toggle" }
 
 			ToggleSettings = Kwargify({
@@ -5855,13 +6423,16 @@ function Luna:CreateWindow(WindowSettings)
 				Description = nil,
 				CurrentValue = false,
 				FireOnInit = false,
-				Callback = function(Value)
-				end,
+				FireOnSet = true,
+				Group = nil,
+				AllowNone = true,
+				FireGroupCallbacks = true,
+				Callback = function(Value) end,
 			}, ToggleSettings or {})
 
+			ToggleV.Settings = ToggleSettings
 
 			local Toggle
-
 			if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" then
 				Toggle = Elements.Template.ToggleDesc:Clone()
 			else
@@ -5870,11 +6441,10 @@ function Luna:CreateWindow(WindowSettings)
 
 			Toggle.Visible = true
 			Toggle.Parent = TabPage
-
-			Toggle.Name = ToggleSettings.Name .. " - Toggle"
-			Toggle.Title.Text = ToggleSettings.Name
+			Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
+			Toggle.Title.Text = tostring(ToggleSettings.Name)
 			if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" then
-				Toggle.Desc.Text = ToggleSettings.Description
+				Toggle.Desc.Text = tostring(ToggleSettings.Description)
 			end
 
 			Toggle.UIStroke.Transparency = 1
@@ -5888,128 +6458,203 @@ function Luna:CreateWindow(WindowSettings)
 				TweenService:Create(Toggle.Desc, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 			end
 			TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-			TweenService:Create(Toggle.Title, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
+			TweenService:Create(Toggle.Title, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 
-			local function Set(bool)
-				if bool then
+			local function Render(state)
+				state = state == true
+				if state then
 					Toggle.toggle.color.Enabled = true
 					tween(Toggle.toggle, {BackgroundTransparency = 0})
-
 					Toggle.toggle.UIStroke.color.Enabled = true
-					tween(Toggle.toggle.UIStroke, {Color = Color3.new(255,255,255)})
-
-					tween(Toggle.toggle.val, {BackgroundColor3 = Color3.fromRGB(255,255,255), Position = UDim2.new(1,-23,0.5,0), BackgroundTransparency = 0.45})
+					tween(Toggle.toggle.UIStroke, {Color = Color3.fromRGB(255,255,255)})
+					tween(Toggle.toggle.val, {
+						BackgroundColor3 = Color3.fromRGB(255,255,255),
+						Position = UDim2.new(1,-23,0.5,0),
+						BackgroundTransparency = 0.45,
+					})
 				else
 					Toggle.toggle.color.Enabled = false
 					Toggle.toggle.UIStroke.color.Enabled = false
-
 					Toggle.toggle.UIStroke.Color = Color3.fromRGB(97,97,97)
-
 					tween(Toggle.toggle, {BackgroundTransparency = 1})
-
-					tween(Toggle.toggle.val, {BackgroundColor3 = Color3.fromRGB(97,97,97), Position = UDim2.new(0,5,0.5,0), BackgroundTransparency = 0})
+					tween(Toggle.toggle.val, {
+						BackgroundColor3 = Color3.fromRGB(97,97,97),
+						Position = UDim2.new(0,5,0.5,0),
+						BackgroundTransparency = 0,
+					})
 				end
-
-				ToggleV.CurrentValue = bool
 			end
 
-			Toggle.Interact.MouseButton1Click:Connect(function()
-				ToggleSettings.CurrentValue = not ToggleSettings.CurrentValue
-				Set(ToggleSettings.CurrentValue)
-
-				local Success, Response = pcall(function()
-					ToggleSettings.Callback(ToggleSettings.CurrentValue)
-				end)
-				if not Success then
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-					Toggle.Title.Text = "Callback Error"
-					print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-					wait(0.5)
-					Toggle.Title.Text = ToggleSettings.Name
+			local function ShowCallbackError(response)
+				if not Toggle.Parent then return end
+				Luna._Stats.CallbackErrors += 1
+				warn("Luna UI callback error: " .. tostring(response))
+				TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
+				TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
+				TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
+				Toggle.Title.Text = "Callback Error"
+				task.delay(0.5, function()
+					if not Toggle.Parent then return end
+					Toggle.Title.Text = tostring(ToggleSettings.Name)
 					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
 					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
+				end)
+			end
+
+			local function EmitCallback(state)
+				if not IsComponentUsable(ToggleV) then return false end
+				local success, response = pcall(ToggleSettings.Callback, state)
+				if not success then
+					ShowCallbackError(response)
+				end
+				return success, response
+			end
+
+			local function SetRawState(state)
+				state = state == true
+				ToggleSettings.CurrentValue = state
+				ToggleV.CurrentValue = state
+				Render(state)
+				return state
+			end
+
+			local function ApplyState(state, fireCallback, enforceGroup, fireGroupCallbacks, force)
+				state = state == true
+				force = force == true
+				local group = ToggleV._ToggleGroup
+
+				if group and Luna._MutatingToggleGroups[group] and not force then
+					return ToggleV, false, "Toggle group is busy."
+				end
+
+				if not state
+					and group
+					and enforceGroup ~= false
+					and not force
+					and not ToggleGroupAllowsNone(group)
+					and not ToggleGroupHasOtherActive(ToggleV)
+				then
+					return ToggleV, false, "At least one toggle in this group must remain active."
+				end
+
+				if state and group and enforceGroup ~= false then
+					if not BeginToggleGroupMutation(group) then
+						return ToggleV, false, "Toggle group is busy."
+					end
+
+					local deactivated = DeactivateToggleGroup(ToggleV)
+					SetRawState(true)
+
+					if fireGroupCallbacks == true then
+						for _, member in ipairs(deactivated) do
+							if type(member._EmitExclusiveCallback) == "function" then
+								member:_EmitExclusiveCallback(false)
+							end
+						end
+					end
+					if fireCallback == true then
+						EmitCallback(true)
+					end
+					EndToggleGroupMutation(group)
+				else
+					SetRawState(state)
+					if fireCallback == true then
+						EmitCallback(state)
+					end
+				end
+				return ToggleV, true
+			end
+
+			function ToggleV:_ApplyExclusiveState(state, fireCallback)
+				SetRawState(state)
+				if fireCallback == true then
+					EmitCallback(state == true)
+				end
+				return self
+			end
+
+			function ToggleV:_EmitExclusiveCallback(state)
+				return EmitCallback(state == true)
+			end
+
+			function ToggleV:GetGroup()
+				return self._ToggleGroup
+			end
+
+			function ToggleV:SetGroup(group, fireGroupCallbacks)
+				ToggleSettings.Group = group
+				RegisterToggleGroup(self, group)
+				if self.CurrentValue == true and self._ToggleGroup then
+					ApplyState(true, false, true, fireGroupCallbacks == true, true)
+				end
+				NormalizeAllToggleGroups(false)
+				return self
+			end
+
+			ConnectComponent(ToggleV, Toggle.Interact.MouseButton1Click, function()
+				if not IsComponentUsable(ToggleV) then return end
+				ApplyState(
+					not ToggleSettings.CurrentValue,
+					true,
+					true,
+					ToggleSettings.FireGroupCallbacks ~= false,
+					false
+				)
+			end)
+
+			ConnectComponent(ToggleV, Toggle.MouseEnter, function()
+				if not ToggleV.Disabled then
+					tween(Toggle.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 				end
 			end)
 
-			Toggle["MouseEnter"]:Connect(function()
-				tween(Toggle.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
-			end)
-
-			Toggle["MouseLeave"]:Connect(function()
+			ConnectComponent(ToggleV, Toggle.MouseLeave, function()
 				tween(Toggle.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 			end)
 
-			if ToggleSettings.CurrentValue then
-				Set(ToggleSettings.CurrentValue)
-				local Success, Response = true, nil
-				if ToggleSettings.FireOnInit then Success, Response = pcall(function()
-					ToggleSettings.Callback(ToggleSettings.CurrentValue)
-				end) end
-				if not Success then
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-					Toggle.Title.Text = "Callback Error"
-					print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-					wait(0.5)
-					Toggle.Title.Text = ToggleSettings.Name
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-				end
-			end
-
-			function ToggleV:UpdateState(State)
-				ToggleSettings.CurrentValue = State
-				Set(ToggleSettings.CurrentValue)
+			function ToggleV:UpdateState(state, force)
+				return ApplyState(state, false, true, false, force == true)
 			end
 
 			function ToggleV:Set(NewToggleSettings)
-
 				NewToggleSettings = Kwargify({
 					Name = ToggleSettings.Name,
 					Description = ToggleSettings.Description,
 					CurrentValue = ToggleSettings.CurrentValue,
-					Callback = ToggleSettings.Callback
+					FireOnInit = ToggleSettings.FireOnInit,
+					FireOnSet = ToggleSettings.FireOnSet,
+					Group = ToggleSettings.Group,
+					AllowNone = ToggleSettings.AllowNone,
+					FireGroupCallbacks = ToggleSettings.FireGroupCallbacks,
+					Callback = ToggleSettings.Callback,
 				}, NewToggleSettings or {})
 
-				ToggleV.Settings = NewToggleSettings
 				ToggleSettings = NewToggleSettings
+				ToggleV.Settings = NewToggleSettings
+				RegisterToggleGroup(ToggleV, ToggleSettings.Group)
 
-				Toggle.Name = ToggleSettings.Name .. " - Toggle"
-				Toggle.Title.Text = ToggleSettings.Name
-				if ToggleSettings.Description ~= nil and ToggleSettings.Description ~= "" and Toggle.Desc ~= nil then
-					Toggle.Desc.Text = ToggleSettings.Description
+				Toggle.Name = tostring(ToggleSettings.Name) .. " - Toggle"
+				Toggle.Title.Text = tostring(ToggleSettings.Name)
+				if Toggle.Desc ~= nil then
+					Toggle.Desc.Text = tostring(ToggleSettings.Description or "")
 				end
 
-				Set(ToggleSettings.CurrentValue)
-
-				ToggleV.CurrentValue = ToggleSettings.CurrentValue
-
-				local Success, Response = pcall(function()
-					ToggleSettings.Callback(ToggleSettings.CurrentValue)
-				end)
-				if not Success then
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0}):Play()
-					Toggle.Title.Text = "Callback Error"
-					print("Luna Interface Suite | "..ToggleSettings.Name.." Callback Error " ..tostring(Response))
-					wait(0.5)
-					Toggle.Title.Text = ToggleSettings.Name
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-				end
+				local shouldFire = NewToggleSettings.Silent ~= true
+					and ToggleSettings.FireOnSet ~= false
+				return ApplyState(
+					ToggleSettings.CurrentValue,
+					shouldFire,
+					true,
+					shouldFire and ToggleSettings.FireGroupCallbacks ~= false,
+					NewToggleSettings.Force == true
+				)
 			end
 
 			function ToggleV:Destroy()
+				RemoveToggleFromGroup(ToggleV)
 				RemoveOption(ToggleV)
-				Toggle.Visible = false
-				Toggle:Destroy()
+				if Toggle.Parent then Toggle:Destroy() end
 			end
 
 			ConnectComponent(ToggleV, LunaUI.ThemeRemote:GetPropertyChangedSignal("Value"), function()
@@ -6019,16 +6664,25 @@ function Luna:CreateWindow(WindowSettings)
 				end
 			end)
 
-			if Flag then
-				RegisterOption(Flag, ToggleV)
-			end
-
+			if Flag then RegisterOption(Flag, ToggleV) end
 			ToggleV._Object = Toggle
+			ToggleV = EnhanceComponent(ToggleV)
+			RegisterToggleGroup(ToggleV, ToggleSettings.Group)
 
-			return EnhanceComponent(ToggleV)
-
+			ApplyState(
+				ToggleSettings.CurrentValue,
+				ToggleSettings.CurrentValue == true and ToggleSettings.FireOnInit == true,
+				true,
+				false,
+				true
+			)
+			task.defer(function()
+				if not ToggleV._Destroyed then
+					NormalizeAllToggleGroups(false)
+				end
+			end)
+			return ToggleV
 		end
-
 		-- Bind
 		function Tab:CreateBind(BindSettings, Flag)
 			local BindV = {Class = "Bind", IgnoreConfig = false, Settings = BindSettings, Active = false}
@@ -6187,165 +6841,176 @@ function Luna:CreateWindow(WindowSettings)
 				PlaceholderText = "Input Placeholder",
 				RemoveTextAfterFocusLost = false,
 				Numeric = false,
+				AllowNegative = true,
+				AllowDecimal = true,
 				Enter = false,
 				MaxCharacters = nil,
-				Callback = function(Text)
-
-				end, -- 52
+				FireOnInit = false,
+				FireOnSet = true,
+				Callback = function(Text) end,
 			}, InputSettings or {})
 
-			InputV.CurrentValue = InputSettings.CurrentValue
+			InputV.Settings = InputSettings
+			local descriptionEnabled = InputSettings.Description ~= nil
+				and InputSettings.Description ~= ""
+			local Input = descriptionEnabled
+				and Elements.Template.InputDesc:Clone()
+				or Elements.Template.Input:Clone()
+			local TextBox = Input.InputFrame.InputBox
 
-			local descriptionbool
-			if InputSettings.Description ~= nil and InputSettings.Description ~= "" then
-				descriptionbool = true
+			Input.Name = tostring(InputSettings.Name)
+			Input.Title.Text = tostring(InputSettings.Name)
+			if descriptionEnabled and Input:FindFirstChild("Desc") then
+				Input.Desc.Text = tostring(InputSettings.Description)
 			end
-
-			local Input 
-			if descriptionbool then
-				Input = Elements.Template.InputDesc:Clone()
-			else
-				Input = Elements.Template.Input:Clone()
-			end
-
-			Input.Name = InputSettings.Name
-			Input.Title.Text = InputSettings.Name
-			if descriptionbool then Input.Desc.Text = InputSettings.Description end
 			Input.Visible = true
 			Input.Parent = TabPage
 
 			Input.BackgroundTransparency = 1
 			Input.UIStroke.Transparency = 1
 			Input.Title.TextTransparency = 1
-			if descriptionbool then Input.Desc.TextTransparency = 1 end
+			if descriptionEnabled and Input:FindFirstChild("Desc") then
+				Input.Desc.TextTransparency = 1
+			end
 			Input.InputFrame.BackgroundTransparency = 1
 			Input.InputFrame.UIStroke.Transparency = 1
-			Input.InputFrame.InputBox.TextTransparency = 1
+			TextBox.TextTransparency = 1
 
 			TweenService:Create(Input, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
 			TweenService:Create(Input.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-			TweenService:Create(Input.Title, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()	
-			if descriptionbool then TweenService:Create(Input.Desc, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play() end
+			TweenService:Create(Input.Title, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+			if descriptionEnabled and Input:FindFirstChild("Desc") then
+				TweenService:Create(Input.Desc, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+			end
 			TweenService:Create(Input.InputFrame, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.9}):Play()
 			TweenService:Create(Input.InputFrame.UIStroke, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {Transparency = 0.3}):Play()
-			TweenService:Create(Input.InputFrame.InputBox, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
+			TweenService:Create(TextBox, TweenInfo.new(0.3, Enum.EasingStyle.Exponential), {TextTransparency = 0}):Play()
 
-			Input.InputFrame.InputBox.PlaceholderText = InputSettings.PlaceholderText
-			Input.InputFrame.Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 30)
+			local updatingText = false
 
-			Input.InputFrame.InputBox.FocusLost:Connect(function(bleh)
-
-				if InputSettings.Enter then
-					if bleh then
-						local Success, Response = pcall(function()
-							InputSettings.Callback(Input.InputFrame.InputBox.Text)
-							InputV.CurrentValue = Input.InputFrame.InputBox.Text
-						end)
-						if not Success then
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-							TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-							Input.Title.Text = "Callback Error"
-							print("Luna Interface Suite | "..InputSettings.Name.." Callback Error " ..tostring(Response))
-							wait(0.5)
-							Input.Title.Text = InputSettings.Name
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-							TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-							TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-						end
+			local function sanitizeNumeric(text)
+				text = tostring(text or "")
+				local negative = InputSettings.AllowNegative ~= false
+					and text:sub(1, 1) == "-"
+				local body = text:gsub("[^%d%.]", "")
+				if InputSettings.AllowDecimal == false then
+					body = body:gsub("%.", "")
+				else
+					local firstDot = body:find(".", 1, true)
+					if firstDot then
+						body = body:sub(1, firstDot)
+							.. body:sub(firstDot + 1):gsub("%.", "")
 					end
 				end
-
-				if InputSettings.RemoveTextAfterFocusLost then
-					Input.InputFrame.InputBox.Text = ""
-				end
-
-			end)
-
-			if InputSettings.Numeric then
-				Input.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
-					local text = Input.InputFrame.InputBox.Text
-					if not tonumber(text) and text ~= "." then
-						Input.InputFrame.InputBox.Text = text:match("[0-9.]*") or ""
-					end
-				end)
+				return (negative and "-" or "") .. body
 			end
 
-			Input.InputFrame.InputBox:GetPropertyChangedSignal("Text"):Connect(function()
-				if tonumber(InputSettings.MaxCharacters) then
-					if (#Input.InputFrame.InputBox.Text - 1) == InputSettings.MaxCharacters then
-						Input.InputFrame.InputBox.Text = Input.InputFrame.InputBox.Text:sub(1, InputSettings.MaxCharacters)
+			local function sanitizeText(value)
+				local text = tostring(value or "")
+				if InputSettings.Numeric then
+					text = sanitizeNumeric(text)
+				end
+				local maximum = tonumber(InputSettings.MaxCharacters)
+				if maximum then
+					maximum = math.max(0, math.floor(maximum))
+					if #text > maximum then
+						text = text:sub(1, maximum)
 					end
 				end
-				TweenService:Create(Input.InputFrame, TweenInfo.new(0.55, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 30)}):Play()
-				if not InputSettings.Enter then
-					local Success, Response = pcall(function()
-						InputSettings.Callback(Input.InputFrame.InputBox.Text)
-					end)
-					if not Success then
-						TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0}):Play()
-						TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
-						TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
-						Input.Title.Text = "Callback Error"
-						print("Luna Interface Suite | "..InputSettings.Name.." Callback Error " ..tostring(Response))
-						wait(0.5)
-						Input.Title.Text = InputSettings.Name
-						TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
-						TweenService:Create(Input, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(32, 30, 38)}):Play()
-						TweenService:Create(Input.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 0.5}):Play()
-					end
+				return text
+			end
+
+			local function resizeInput()
+				local width = math.clamp(TextBox.TextBounds.X + 52, 90, 320)
+				Input.InputFrame.Size = UDim2.fromOffset(width, 30)
+			end
+
+			local function emitCallback(text)
+				if IsComponentUsable(InputV) then
+					return SafeCall(InputSettings.Callback, text)
 				end
-				InputV.CurrentValue = Input.InputFrame.InputBox.Text				
+				return false
+			end
+
+			local function applyText(value, fireCallback, forceCallback)
+				local text = sanitizeText(value)
+				local changed = tostring(InputV.CurrentValue or "") ~= text
+				InputSettings.CurrentValue = text
+				InputV.CurrentValue = text
+				if TextBox.Text ~= text then
+					updatingText = true
+					TextBox.Text = text
+					updatingText = false
+				end
+				resizeInput()
+				if fireCallback == true and (changed or forceCallback == true) then
+					emitCallback(text)
+				end
+				return text
+			end
+
+			TextBox.PlaceholderText = tostring(InputSettings.PlaceholderText or "")
+			ConnectComponent(InputV, TextBox:GetPropertyChangedSignal("Text"), function()
+				if updatingText or not IsComponentUsable(InputV) then return end
+				applyText(TextBox.Text, not InputSettings.Enter, false)
 			end)
 
-			Input["MouseEnter"]:Connect(function()
-				tween(Input.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+			ConnectComponent(InputV, TextBox.FocusLost, function(enterPressed)
+				local shouldFire = InputSettings.Enter and enterPressed == true
+				applyText(TextBox.Text, shouldFire, shouldFire)
+				if InputSettings.RemoveTextAfterFocusLost then
+					applyText("", false, false)
+				end
 			end)
 
-			Input["MouseLeave"]:Connect(function()
+			ConnectComponent(InputV, Input.MouseEnter, function()
+				if not InputV.Disabled then
+					tween(Input.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
+				end
+			end)
+			ConnectComponent(InputV, Input.MouseLeave, function()
 				tween(Input.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 			end)
 
+			function InputV:UpdateValue(value, silent)
+				applyText(value, silent ~= true, false)
+				return self
+			end
 
 			function InputV:Set(NewInputSettings)
-
 				NewInputSettings = Kwargify(InputSettings, NewInputSettings or {})
-
-				InputV.Settings = NewInputSettings
 				InputSettings = NewInputSettings
-
-				Input.Name = InputSettings.Name
-				Input.Title.Text = InputSettings.Name
-				if InputSettings.Description ~= nil and InputSettings.Description ~= "" and Input.Desc ~= nil then
-					Input.Desc.Text = InputSettings.Description
+				InputV.Settings = NewInputSettings
+				Input.Name = tostring(InputSettings.Name)
+				Input.Title.Text = tostring(InputSettings.Name)
+				TextBox.PlaceholderText = tostring(InputSettings.PlaceholderText or "")
+				if Input:FindFirstChild("Desc") then
+					Input.Desc.Text = tostring(InputSettings.Description or "")
 				end
-
-				Input.InputFrame.InputBox:CaptureFocus()
-				Input.InputFrame.InputBox.Text = tostring(InputSettings.CurrentValue)
-				Input.InputFrame.InputBox:ReleaseFocus()
-				Input.InputFrame.Size = UDim2.new(0, Input.InputFrame.InputBox.TextBounds.X + 52, 0, 42)
-
-				InputV.CurrentValue = InputSettings.CurrentValue
+				local shouldFire = NewInputSettings.Silent ~= true
+					and InputSettings.FireOnSet ~= false
+				applyText(
+					InputSettings.CurrentValue,
+					shouldFire,
+					NewInputSettings.ForceCallback == true
+				)
+				return self
 			end
 
 			function InputV:Destroy()
 				RemoveOption(InputV)
-				Input.Visible = false
-				Input:Destroy()
+				if Input.Parent then Input:Destroy() end
 			end
 
-			if Flag then
-				RegisterOption(Flag, InputV)
-			end
-
-
+			if Flag then RegisterOption(Flag, InputV) end
 			InputV._Object = Input
-
-
-			return EnhanceComponent(InputV)
-
+			InputV = EnhanceComponent(InputV)
+			applyText(InputSettings.CurrentValue, false, false)
+			if InputSettings.FireOnInit then
+				emitCallback(InputV.CurrentValue)
+			end
+			return InputV
 		end
-
 		-- Dropdown
 		function Tab:CreateDropdown(DropdownSettings, Flag)
 			local DropdownV = { IgnoreConfig = false, Class = "Dropdown", Settings = DropdownSettings}
@@ -6409,7 +7074,11 @@ function Luna:CreateWindow(WindowSettings)
 				end
 			end
 
-			local function SafeCallback(param, c2)
+			local function SafeCallback(param, c2, silent)
+				if silent == true then
+					if c2 then c2() end
+					return true
+				end
 				local callbackParam = param
 				if DropdownSettings.SpecialType == "Player" and DropdownSettings.ReturnPlayerInstance then
 					if type(param) == "string" then
@@ -6443,7 +7112,7 @@ function Luna:CreateWindow(WindowSettings)
 			end
 
 			-- fixed by justhey
-			Dropdown.Selected:GetPropertyChangedSignal("Text"):Connect(function()
+			ConnectComponent(DropdownV, Dropdown.Selected:GetPropertyChangedSignal("Text"), function()
 				local text = Dropdown.Selected.Text:lower()
 				for _, Item in ipairs(Dropdown.List:GetChildren()) do
 					if Item:IsA("TextLabel") and Item.Name ~= "Template" then
@@ -6568,15 +7237,15 @@ function Luna:CreateWindow(WindowSettings)
 				DropdownV.CurrentOption = DropdownSettings.MultipleOptions and valid or valid[1]
 			end
 
-			Dropdown.Interact.MouseButton1Click:Connect(function()
+			ConnectComponent(DropdownV, Dropdown.Interact.MouseButton1Click, function()
 				Toggle()
 			end)
 
-			Dropdown["MouseEnter"]:Connect(function()
+			ConnectComponent(DropdownV, Dropdown.MouseEnter, function()
 				tween(Dropdown.UIStroke, {Color = Color3.fromRGB(87, 84, 104)})
 			end)
 
-			Dropdown["MouseLeave"]:Connect(function()
+			ConnectComponent(DropdownV, Dropdown.MouseLeave, function()
 				tween(Dropdown.UIStroke, {Color = Color3.fromRGB(64,61,76)})
 			end)
 
@@ -6680,7 +7349,8 @@ function Luna:CreateWindow(WindowSettings)
 					ind = ind + 1
 				end
 				if ind == 1 then bleh = DropdownSettings.CurrentOption[1] else bleh = DropdownSettings.CurrentOption end
-				SafeCallback(bleh)
+				DropdownV.CurrentOption = DropdownSettings.CurrentOption
+				SafeCallback(bleh, nil, NewDropdownSettings.Silent == true)
 				for _, Option in pairs(Dropdown.List:GetChildren()) do
 					if Option.ClassName == "TextLabel" then
 						tween(Option, {TextColor3 = Color3.fromRGB(200,200,200), BackgroundTransparency = 0.98})
@@ -6710,7 +7380,7 @@ function Luna:CreateWindow(WindowSettings)
 				Dropdown.Selected.Text = ""
 
 				-- Luna.Flags[DropdownSettings.Flag] = DropdownSettings
-
+				return self
 			end
 
 			function DropdownV:Destroy()
@@ -6997,9 +7667,13 @@ function Luna:CreateWindow(WindowSettings)
 
 			Tab:CreateButton({Name = "Load Config", Description = "Load the selected config.", Callback = function()
 				local name = requireSelected(); if not name then return end
-				local success, result = Luna:LoadConfig(name)
+				local success, result, warnings = Luna:LoadConfig(name)
 				if not success then notify("Unable to load config: " .. tostring(result), "error"); return end
-				notify(string.format("Loaded config %q", name))
+				if type(warnings) == "table" and #warnings > 0 then
+					notify(string.format("Loaded %q with %d skipped setting(s).", name, #warnings), "warning")
+				else
+					notify(string.format("Loaded config %q", name))
+				end
 			end})
 
 			Tab:CreateButton({Name = "Overwrite Config", Description = "Safely overwrite the selected JSON config.", Callback = function()
@@ -7060,9 +7734,11 @@ function Luna:CreateWindow(WindowSettings)
 					return type(data.state) == "boolean",
 						"Toggle state must be a boolean."
 				end,
-				Load = function(flag, data)
+				Load = function(flag, data, loadOptions)
 					Luna.Options[flag]:Set({
 						CurrentValue = data.state,
+						Silent = loadOptions and loadOptions.Silent == true,
+						Force = loadOptions and loadOptions.Force == true,
 					})
 					return true
 				end,
@@ -7083,9 +7759,11 @@ function Luna:CreateWindow(WindowSettings)
 					return tonumber(data.value) ~= nil,
 						"Slider value must be numeric."
 				end,
-				Load = function(flag, data)
+				Load = function(flag, data, loadOptions)
 					Luna.Options[flag]:Set({
 						CurrentValue = tonumber(data.value),
+						Silent = loadOptions and loadOptions.Silent == true,
+						ForceCallback = loadOptions and loadOptions.ForceCallback == true,
 					})
 					return true
 				end,
@@ -7102,9 +7780,11 @@ function Luna:CreateWindow(WindowSettings)
 					return type(data.text) == "string",
 						"Input text must be a string."
 				end,
-				Load = function(flag, data)
+				Load = function(flag, data, loadOptions)
 					Luna.Options[flag]:Set({
 						CurrentValue = data.text,
+						Silent = loadOptions and loadOptions.Silent == true,
+						ForceCallback = loadOptions and loadOptions.ForceCallback == true,
 					})
 					return true
 				end,
@@ -7126,9 +7806,10 @@ function Luna:CreateWindow(WindowSettings)
 					return valueType == "table" or valueType == "string",
 						"Dropdown value must be a string or table."
 				end,
-				Load = function(flag, data)
+				Load = function(flag, data, loadOptions)
 					Luna.Options[flag]:Set({
 						CurrentOption = data.value,
+						Silent = loadOptions and loadOptions.Silent == true,
 					})
 					return true
 				end,
@@ -7152,10 +7833,19 @@ function Luna:CreateWindow(WindowSettings)
 					return InputBindingName(data.bind) ~= nil,
 						"Keybind is invalid."
 				end,
-				Load = function(flag, data)
-					Luna.Options[flag]:Set({
-						CurrentBind = InputBindingName(data.bind),
+				Load = function(flag, data, loadOptions)
+					local option = Luna.Options[flag]
+					local bindName = InputBindingName(data.bind)
+					option:Set({
+						CurrentBind = bindName,
+						Silent = loadOptions and loadOptions.Silent == true,
 					})
+					if loadOptions
+						and loadOptions.ForceCallback == true
+						and option.Settings
+					then
+						SafeCall(option.Settings.OnChangedCallback, bindName)
+					end
 					return true
 				end,
 			},
@@ -7189,7 +7879,7 @@ function Luna:CreateWindow(WindowSettings)
 					end
 					return true
 				end,
-				Load = function(flag, data)
+				Load = function(flag, data, loadOptions)
 					local color = Color3.fromRGB(
 						tonumber(data.color:sub(2, 3), 16),
 						tonumber(data.color:sub(4, 5), 16),
@@ -7198,6 +7888,7 @@ function Luna:CreateWindow(WindowSettings)
 					Luna.Options[flag]:Set({
 						Color = color,
 						Alpha = tonumber(data.alpha) or 0,
+						Silent = loadOptions and loadOptions.Silent == true,
 					})
 					return true
 				end,
@@ -7304,10 +7995,9 @@ function Luna:CreateWindow(WindowSettings)
 
 			local c3cp = Tab:CreateColorPicker({
 				Name = "Color 3",
-				Color = Color3.fromRGB(224, 138, 184),
+				Color = Color3.fromRGB(224, 138, 175),
 			}, "LunaInterfaceSuitePrebuiltCPC3") 
 
-			task.wait(1)
 
 			c1cp:Set({
 				Callback = function(Value)
@@ -7545,7 +8235,12 @@ function Luna:CreateWindow(WindowSettings)
 			return true, safeName
 		end
 
-		function Luna:LoadConfig(path)
+		function Luna:LoadConfig(path, loadOptions)
+			loadOptions = type(loadOptions) == "table" and loadOptions or {}
+			local strict = loadOptions.Strict
+			if strict == nil then strict = Luna.StrictConfig == true end
+			local fireCallbacks = loadOptions.FireCallbacks ~= false
+
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
 
@@ -7566,22 +8261,100 @@ function Luna:CreateWindow(WindowSettings)
 			if not decodeSuccess then return false, decoded end
 
 			local valid, validationError =
-				ValidateConfigDocument(decoded, true)
+				ValidateConfigDocument(decoded, false)
 			if not valid then return false, validationError end
 
+			local applicable = {}
+			local warnings = {}
+
 			for _, object in ipairs(decoded.objects) do
-				local parser = ClassParser[object.type]
-				local success, result =
-					pcall(parser.Load, object.flag, object)
-				if not success or result ~= true then
-					return false, ("Unable to load flag %q: %s"):format(
-						object.flag,
-						tostring(result)
-					)
+				local current = Luna.Options[object.flag]
+				if not current then
+					local warning =
+						("Config flag %q does not exist in the current interface."):format(
+							object.flag
+						)
+					if strict then return false, warning end
+					table.insert(warnings, warning)
+				elseif current.Class ~= object.type then
+					local warning =
+						("Config flag %q expects %s but found %s."):format(
+							object.flag,
+							tostring(current.Class),
+							tostring(object.type)
+						)
+					if strict then return false, warning end
+					table.insert(warnings, warning)
+				else
+					table.insert(applicable, object)
 				end
 			end
 
-			return true, safeName
+			local snapshots = {}
+			for _, object in ipairs(applicable) do
+				local option = Luna.Options[object.flag]
+				local parser = ClassParser[option.Class]
+				local snapshotSuccess, snapshot, snapshotError =
+					pcall(parser.Save, object.flag, option)
+				if not snapshotSuccess or type(snapshot) ~= "table" then
+					return false, ("Unable to snapshot flag %q: %s"):format(
+						object.flag,
+						tostring(snapshotError or snapshot)
+					)
+				end
+				table.insert(snapshots, snapshot)
+			end
+
+			local function applyObjects(objects, silent, forceCallbacks)
+				for _, object in ipairs(objects) do
+					local parser = ClassParser[object.type]
+					local success, result = pcall(
+						parser.Load,
+						object.flag,
+						object,
+						{
+							Silent = silent == true,
+							Force = true,
+							ForceCallback = forceCallbacks == true,
+						}
+					)
+					if not success or result ~= true then
+						return false, ("Unable to load flag %q: %s"):format(
+							object.flag,
+							tostring(result)
+						)
+					end
+				end
+				return true
+			end
+
+			-- Phase one is silent so component state can be rolled back safely.
+			local applySuccess, applyError = applyObjects(applicable, true, false)
+			if applySuccess then
+				NormalizeAllToggleGroups(false)
+			else
+				applyObjects(snapshots, true, false)
+				NormalizeAllToggleGroups(false)
+				Luna._Stats.ConfigRollbacks += 1
+				return false, applyError
+			end
+
+			-- Preserve the old Luna behaviour by notifying components only after
+			-- every state has been applied successfully.
+			if fireCallbacks then
+				local callbackSuccess, callbackError =
+					applyObjects(applicable, false, true)
+				if not callbackSuccess then
+					applyObjects(snapshots, true, false)
+					NormalizeAllToggleGroups(false)
+					Luna._Stats.ConfigRollbacks += 1
+					return false, callbackError
+				end
+				NormalizeAllToggleGroups(false)
+			end
+
+			Luna._Stats.ConfigWarnings += #warnings
+			return true, safeName, warnings
 		end
 
 		function Luna:RefreshConfigList()
@@ -7762,13 +8535,13 @@ function Luna:CreateWindow(WindowSettings)
 				success and "Autoload deleted." or tostring(deleteError)
 		end
 
-		function Luna:LoadAutoloadConfig()
+		function Luna:LoadAutoloadConfig(loadOptions)
 			local name = self:GetAutoload()
 			if not name then
 				return false, "No valid autoload JSON is set."
 			end
 
-			local success, result = self:LoadConfig(name)
+			local success, result, warnings = self:LoadConfig(name, loadOptions)
 			if not success then
 				self:Notification({
 					Title = "Interface",
@@ -7781,16 +8554,20 @@ function Luna:CreateWindow(WindowSettings)
 				return false, result
 			end
 
+			local warningCount = type(warnings) == "table" and #warnings or 0
 			self:Notification({
 				Title = "Interface",
-				Icon = "sparkle",
+				Icon = warningCount > 0 and "warning" or "sparkle",
 				ImageSource = "Material",
-				Content = string.format(
-					"Auto loaded JSON config %q",
-					name
-				),
+				Content = warningCount > 0
+					and string.format(
+						"Auto loaded %q with %d skipped setting(s).",
+						name,
+						warningCount
+					)
+					or string.format("Auto loaded JSON config %q", name),
 			})
-			return true, name
+			return true, name, warnings
 		end
 
 		function Luna:ExportConfig(path)
@@ -7950,7 +8727,7 @@ function Luna:CreateWindow(WindowSettings)
 		end
 	end))
 
-	Main.Logo.MouseButton1Click:Connect(function()
+	TrackConnection(Main.Logo.MouseButton1Click:Connect(function()
 		if Navigation.Size.X.Offset == 205 then
 			tween(Elements.Parent, {Size = UDim2.new(1, -55, Elements.Parent.Size.Y.Scale, Elements.Parent.Size.Y.Offset)})
 			tween(Navigation, {Size = UDim2.new(Navigation.Size.X.Scale, 55, Navigation.Size.Y.Scale, Navigation.Size.Y.Offset)})
@@ -7958,9 +8735,9 @@ function Luna:CreateWindow(WindowSettings)
 			tween(Elements.Parent, {Size = UDim2.new(1, -205, Elements.Parent.Size.Y.Scale, Elements.Parent.Size.Y.Offset)})
 			tween(Navigation, {Size = UDim2.new(Navigation.Size.X.Scale, 205, Navigation.Size.Y.Scale, Navigation.Size.Y.Offset)})
 		end
-	end)
+	end))
 
-	Main.Controls.ToggleSize.ImageLabel.MouseButton1Click:Connect(function()
+	TrackConnection(Main.Controls.ToggleSize.ImageLabel.MouseButton1Click:Connect(function()
 		Window.Size = not Window.Size
 		if Window.Size then
 			Minimize(Main)
@@ -7969,31 +8746,31 @@ function Luna:CreateWindow(WindowSettings)
 			Maximise(Main)
 			dragBar.Visible = true
 		end
-	end)
-	Main.Controls.ToggleSize["MouseEnter"]:Connect(function()
+	end))
+	TrackConnection(Main.Controls.ToggleSize.MouseEnter:Connect(function()
 		tween(Main.Controls.ToggleSize.ImageLabel, {ImageColor3 = Color3.new(1,1,1)})
-	end)
-	Main.Controls.ToggleSize["MouseLeave"]:Connect(function()
+	end))
+	TrackConnection(Main.Controls.ToggleSize.MouseLeave:Connect(function()
 		tween(Main.Controls.ToggleSize.ImageLabel, {ImageColor3 = Color3.fromRGB(195,195,195)})
-	end)
+	end))
 
-	Main.Controls.Theme.ImageLabel.MouseButton1Click:Connect(function()
+	TrackConnection(Main.Controls.Theme.ImageLabel.MouseButton1Click:Connect(function()
 		if Window.Settings then
 			Window.Settings:Activate()
 			Elements.Settings.CanvasPosition = Vector2.new(0,698)
 		end
-	end)
-	Main.Controls.Theme["MouseEnter"]:Connect(function()
+	end))
+	TrackConnection(Main.Controls.Theme.MouseEnter:Connect(function()
 		tween(Main.Controls.Theme.ImageLabel, {ImageColor3 = Color3.new(1,1,1)})
-	end)
-	Main.Controls.Theme["MouseLeave"]:Connect(function()
+	end))
+	TrackConnection(Main.Controls.Theme.MouseLeave:Connect(function()
 		tween(Main.Controls.Theme.ImageLabel, {ImageColor3 = Color3.fromRGB(195,195,195)})
-	end)	
+	end))	
 
 
-	LunaUI.MobileSupport.Interact.MouseButton1Click:Connect(function()
+	TrackConnection(LunaUI.MobileSupport.Interact.MouseButton1Click:Connect(function()
 		ShowWindow()
-	end)
+	end))
 
 	function Window:SetMinimizeKeybind(value)
 		local binding, bindError = NormalizeInputBinding(value)
@@ -8039,7 +8816,7 @@ function Luna:CreateWindow(WindowSettings)
 	function Window:Hide() return HideWindow() end
 	function Window:Close() CloseWindow() end
 	function Window:Destroy() CloseWindow() end
-	function Window:DestroyLibrary() CloseWindow() end
+	function Window:DestroyLibrary() Luna:Destroy() end
 	function Window:GetDiagnostics() return Luna:GetDiagnostics() end
 	return Window
 end
@@ -8067,7 +8844,12 @@ function Luna:Destroy()
 	end
 	table.clear(Luna.Options)
 	table.clear(Luna._Components)
+	table.clear(Luna._ToggleGroups)
+	table.clear(Luna._MutatingToggleGroups)
 	Luna._Stats.RenderLoops = 0
+	if rawget(GlobalEnvironment, "__LUNA_ACTIVE_LIBRARY") == Luna then
+		GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = nil
+	end
 	pcall(function() LunaUI:Destroy() end)
 end
 
