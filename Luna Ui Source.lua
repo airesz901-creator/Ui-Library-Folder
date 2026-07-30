@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.1 - Collapse Interaction Hotfix"
+local Release = "Luna Custom 7.3.2 - Section Render Hotfix"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -4216,56 +4216,86 @@ local function EnhanceCollapsibleSection(section, settings)
 	settings = type(settings) == "table" and settings or {}
 
 	local header = section._Header
+	local body = section._Body
 	local HEADER_HEIGHT = math.max(24, tonumber(settings.HeaderHeight) or 28)
-	local ARROW_WIDTH = math.max(26, tonumber(settings.ArrowWidth) or 32)
 
-	-- IMPORTANT: The section template contains its body inside the header object.
-	-- A full-scale transparent button therefore covers every child component and
-	-- makes ordinary button/toggle/input clicks collapse the section. Keep both
-	-- interaction targets restricted to the fixed title row only.
-	local titleButton = Instance.new("TextButton")
-	titleButton.Name = "CollapseHeaderInteract"
-	titleButton.BackgroundTransparency = 1
-	titleButton.BorderSizePixel = 0
-	titleButton.Text = ""
-	titleButton.AutoButtonColor = false
-	titleButton.Active = true
-	titleButton.Position = UDim2.fromOffset(0, 0)
-	titleButton.Size = UDim2.new(1, -ARROW_WIDTH, 0, HEADER_HEIGHT)
-	titleButton.ZIndex = header.ZIndex + 1
-	titleButton.Parent = header
+	-- A normal CreateSection remains a normal, always-visible section unless the
+	-- caller explicitly requests collapse behaviour. This prevents a blank tab
+	-- when older scripts pass a settings table without intending to hide content.
+	local isCollapsible = settings.Collapsible == true
+		or settings._LunaExplicitCollapsible == true
+		or settings.DefaultExpanded ~= nil
+		or settings.Collapsed ~= nil
 
-	local arrow = Instance.new("TextButton")
-	arrow.Name = "CollapseArrow"
-	arrow.AnchorPoint = Vector2.new(1, 0)
-	arrow.BackgroundTransparency = 1
-	arrow.BorderSizePixel = 0
-	arrow.AutoButtonColor = false
-	arrow.Active = true
-	arrow.Position = UDim2.new(1, -2, 0, 0)
-	arrow.Size = UDim2.fromOffset(ARROW_WIDTH, HEADER_HEIGHT)
-	arrow.Font = Enum.Font.GothamBold
-	arrow.Text = "▼"
-	arrow.TextColor3 = ProductivityColors.MutedText
-	arrow.TextSize = 13
-	arrow.TextXAlignment = Enum.TextXAlignment.Center
-	arrow.TextYAlignment = Enum.TextYAlignment.Center
-	arrow.ZIndex = header.ZIndex + 2
-	arrow.Parent = header
-	arrow:SetAttribute("LunaCollapseControl", true)
+	if settings.Tooltip then section:SetTooltip(settings.Tooltip) end
 
-	section._CollapseHeaderButton = titleButton
-	section._CollapseArrow = arrow
+	if not isCollapsible then
+		section.Collapsible = false
+		section.Collapsed = false
+		if body then body.Visible = true end
+		header.Text = tostring(section.Name or settings.Name or "Section")
+		return section
+	end
+
+	section.Collapsible = true
+	if body then body.Visible = true end
+	pcall(function() header.ClipsDescendants = false end)
+
+	local expandedArrow = tostring(settings.ExpandedArrow or "▼")
+	local collapsedArrow = tostring(settings.CollapsedArrow or "▶")
+	if settings.UseAsciiArrow == true then
+		expandedArrow, collapsedArrow = "v", ">"
+	end
+
+	local function renderHeader()
+		if not header or not header.Parent then return end
+		local arrowText = section.Collapsed and collapsedArrow or expandedArrow
+		header.Text = arrowText .. "  " .. tostring(section.Name or settings.Name or "Section")
+		header:SetAttribute("LunaCollapsed", section.Collapsed == true)
+		header:SetAttribute("LunaCollapsible", true)
+	end
+
+	-- Put the arrow directly inside the title string. Unlike a child positioned
+	-- at the right edge, this remains visible even when the asset header uses
+	-- automatic width, clipping, or a narrow TextLabel.
+	local interact = Instance.new("TextButton")
+	interact.Name = "CollapseHeaderInteract"
+	interact.BackgroundTransparency = 1
+	interact.BorderSizePixel = 0
+	interact.Text = ""
+	interact.AutoButtonColor = false
+	interact.Active = true
+	interact.Position = UDim2.fromOffset(0, 0)
+	interact.Size = UDim2.new(1, 0, 0, HEADER_HEIGHT)
+	interact.ZIndex = header.ZIndex + 5
+	interact.Parent = header
+	interact:SetAttribute("LunaCollapseControl", true)
+
+	section._CollapseHeaderButton = interact
+	section._CollapseArrow = nil
 
 	local baseSetCollapsed = section.SetCollapsed
+	local baseSet = section.Set
+
 	function section:SetCollapsed(collapsed)
 		if self._Destroyed then return self end
-		baseSetCollapsed(self, collapsed == true)
-		arrow.Text = self.Collapsed and "▶" or "▼"
-		arrow.TextColor3 = self.Collapsed and ProductivityColors.MutedText or ProductivityColors.Text
-		arrow:SetAttribute("LunaCollapsed", self.Collapsed)
+		collapsed = collapsed == true
+		baseSetCollapsed(self, collapsed)
+		self.Collapsed = collapsed
+		if body then body.Visible = not collapsed end
+		renderHeader()
 		EmitEvent("SectionCollapsed", self, self.Collapsed)
 		return self
+	end
+
+	function section:Set(newSection)
+		if self._Destroyed then return self end
+		local result = baseSet(self, newSection)
+		if type(newSection) == "table" then
+			for key, value in pairs(newSection) do settings[key] = value end
+		end
+		renderHeader()
+		return result == nil and self or result
 	end
 
 	function section:IsCollapsed()
@@ -4280,28 +4310,51 @@ local function EnhanceCollapsibleSection(section, settings)
 		return self:SetCollapsed(true)
 	end
 
+	function section:SetCollapsible(enabled)
+		self.Collapsible = enabled ~= false
+		if not self.Collapsible then
+			self:SetCollapsed(false)
+			header.Text = tostring(self.Name or settings.Name or "Section")
+			interact.Visible = false
+		else
+			interact.Visible = true
+			renderHeader()
+		end
+		return self
+	end
+
 	local function toggleSection()
-		if not IsComponentUsable(section) then return end
+		if not IsComponentUsable(section) or section.Collapsible == false then return end
 		section:Toggle()
 	end
 
-	ConnectComponent(section, titleButton.MouseButton1Click, toggleSection)
-	ConnectComponent(section, arrow.MouseButton1Click, toggleSection)
-	ConnectComponent(section, arrow.MouseEnter, function()
-		if not section._Destroyed then
-			tween(arrow, {TextColor3 = ProductivityColors.Text})
+	ConnectComponent(section, interact.MouseButton1Click, toggleSection)
+	ConnectComponent(section, interact.MouseEnter, function()
+		if header and header.Parent and not section._Destroyed then
+			header:SetAttribute("LunaCollapseHover", true)
 		end
 	end)
-	ConnectComponent(section, arrow.MouseLeave, function()
-		if not section._Destroyed then
-			tween(arrow, {
-				TextColor3 = section.Collapsed and ProductivityColors.MutedText or ProductivityColors.Text,
-			})
+	ConnectComponent(section, interact.MouseLeave, function()
+		if header and header.Parent and not section._Destroyed then
+			header:SetAttribute("LunaCollapseHover", false)
 		end
 	end)
 
-	if settings.Tooltip then section:SetTooltip(settings.Tooltip) end
-	section:SetCollapsed(settings.DefaultExpanded == false or settings.Collapsed == true)
+	-- Collapsible sections now open by default. A caller must explicitly set
+	-- DefaultExpanded = false or Collapsed = true to start closed.
+	local initiallyCollapsed = settings.Collapsed == true or settings.DefaultExpanded == false
+	section:SetCollapsed(initiallyCollapsed)
+
+	-- Some UI assets update visibility during the same frame in which they are
+	-- cloned. Re-assert the expanded body once after creation so child controls
+	-- cannot remain hidden because of an initialization race.
+	task.defer(function()
+		if not section._Destroyed and body and body.Parent and not section.Collapsed then
+			body.Visible = true
+			renderHeader()
+		end
+	end)
+
 	if section._Window then
 		section._SearchEntry = RegisterSearchEntry(section._Window, {
 			Name = section.Name,
@@ -4362,8 +4415,12 @@ local function EnhanceContainerAPI(container, parent, window, tab, metadata)
 
 	if metadata.IsTab then
 		function container:CreateCollapsibleSection(settings)
-			settings = type(settings) == "table" and settings or {Name = settings}
-			if settings.DefaultExpanded == nil then settings.DefaultExpanded = false end
+			settings = type(settings) == "table" and ShallowCopy(settings) or {Name = settings}
+			settings.Collapsible = true
+			settings._LunaExplicitCollapsible = true
+			if settings.DefaultExpanded == nil and settings.Collapsed == nil then
+				settings.DefaultExpanded = true
+			end
 			return self:CreateSection(settings)
 		end
 	end
