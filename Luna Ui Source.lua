@@ -1,4 +1,4 @@
-local Release = "Luna Custom 7.3.13 - Topbar Status Layout Hotfix"
+local Release = "Luna Custom 7.5.0 - Super Ultimate Reliability"
 
 local Luna = { 
 	Folder = "Luna", 
@@ -15,6 +15,8 @@ local Luna = {
 	ReducedMotion = false,
 	UIScale = 1,
 	MaxNotificationHistory = 50,
+	MaxConfigBytes = 2 * 1024 * 1024,
+	MaxConfigObjects = 5000,
 }
 
 local UserInputService = game:GetService("UserInputService")
@@ -24,6 +26,16 @@ local RunService = game:GetService("RunService")
 local Localization = game:GetService("LocalizationService")
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
+if not Player then
+	local started = os.clock()
+	repeat
+		RunService.Heartbeat:Wait()
+		Player = Players.LocalPlayer
+	until Player or (os.clock() - started) >= 10
+end
+if not Player then
+	error("Luna UI must run in a client context with Players.LocalPlayer available.")
+end
 local Camera = workspace.CurrentCamera
 
 local function GetCurrentCamera()
@@ -60,7 +72,9 @@ Luna._NotificationHistory = {}
 Luna._NotificationById = {}
 Luna._Themes = {}
 Luna._Windows = setmetatable({}, {__mode = "k"})
+Luna._Overlays = setmetatable({}, {__mode = "k"})
 Luna._KnownConfigs = {}
+Luna._SessionId = HttpService:GenerateGUID(false)
 Luna._Stats = {
 	CallbackErrors = 0,
 	NotificationsCreated = 0,
@@ -73,6 +87,24 @@ Luna._Stats = {
 	ModalsOpened = 0,
 	CommandPaletteSearches = 0,
 	DependencyLinks = 0,
+	RuntimeErrors = 0,
+	RuntimeWarnings = 0,
+	AssetValidationFailures = 0,
+	ConfigWriteRecoveries = 0,
+	StatusUpdates = 0,
+	ConnectionErrors = 0,
+	AsyncTasksStarted = 0,
+	AsyncTasksCompleted = 0,
+	AsyncTasksCancelled = 0,
+	ActiveAsyncTasks = 0,
+	DependencyCyclesRejected = 0,
+	TweenCancellations = 0,
+	BlurFallbacks = 0,
+	DragClamps = 0,
+	FilesystemErrors = 0,
+	ConfigRepairs = 0,
+	OverlayCleanups = 0,
+	DuplicateWindowRequests = 0,
 }
 
 local function TrackConnection(connection, bucket)
@@ -103,21 +135,161 @@ local function AddCleanup(callback)
 	return callback
 end
 
+local function TracebackMessage(errorMessage)
+	local message = tostring(errorMessage)
+	if type(debug) == "table" and type(debug.traceback) == "function" then
+		local success, traced = pcall(debug.traceback, message, 3)
+		if success and type(traced) == "string" then return traced end
+	end
+	return message
+end
+
 local function SafeCall(callback, ...)
 	if type(callback) ~= "function" then
 		return false, "Callback is unavailable."
 	end
-	local success, result = pcall(callback, ...)
-	if not success then
+	local arguments = table.pack(...)
+	local results = table.pack(xpcall(function()
+		return callback(table.unpack(arguments, 1, arguments.n))
+	end, TracebackMessage))
+	if not results[1] then
 		Luna._Stats.CallbackErrors += 1
-		warn("Luna UI callback error: " .. tostring(result))
+		warn("Luna UI callback error: " .. tostring(results[2]))
+		return false, results[2]
 	end
-	return success, result
+	return true, table.unpack(results, 2, results.n)
+end
+
+local WarnedMessages = {}
+
+local function WarnOnce(key, message)
+	key = tostring(key or message or "LunaWarning")
+	if WarnedMessages[key] then return false end
+	WarnedMessages[key] = true
+	Luna._Stats.RuntimeWarnings += 1
+	warn("Luna UI: " .. tostring(message or key))
+	return true
+end
+
+local function IsSessionAlive(sessionId)
+	return Luna._Destroyed ~= true and Luna._SessionId == sessionId
+end
+
+local function RunManagedAsync(mode, callback, ...)
+	if type(callback) ~= "function" then return nil end
+	local sessionId = Luna._SessionId
+	local arguments = table.pack(...)
+	Luna._Stats.AsyncTasksStarted += 1
+	Luna._Stats.ActiveAsyncTasks += 1
+	local function runner()
+		if not IsSessionAlive(sessionId) then
+			Luna._Stats.AsyncTasksCancelled += 1
+			Luna._Stats.ActiveAsyncTasks = math.max(0, Luna._Stats.ActiveAsyncTasks - 1)
+			return
+		end
+		local success, err = xpcall(function()
+			callback(table.unpack(arguments, 1, arguments.n))
+		end, TracebackMessage)
+		if not success then
+			Luna._Stats.RuntimeErrors += 1
+			WarnOnce("async:" .. tostring(err), "Managed async task failed: " .. tostring(err))
+		end
+		Luna._Stats.AsyncTasksCompleted += 1
+		Luna._Stats.ActiveAsyncTasks = math.max(0, Luna._Stats.ActiveAsyncTasks - 1)
+	end
+	if mode == "defer" then
+		return task.defer(runner)
+	elseif type(mode) == "number" then
+		return task.delay(math.max(0, mode), runner)
+	end
+	return task.spawn(runner)
+end
+
+local function ManagedDefer(callback, ...)
+	return RunManagedAsync("defer", callback, ...)
+end
+
+local function ManagedSpawn(callback, ...)
+	return RunManagedAsync("spawn", callback, ...)
+end
+
+local function ManagedDelay(seconds, callback, ...)
+	return RunManagedAsync(math.max(0, tonumber(seconds) or 0), callback, ...)
+end
+
+local function IsGuiObject(instance)
+	return typeof(instance) == "Instance" and instance:IsA("GuiObject")
+end
+
+local function GetGuiZIndex(instance, fallback)
+	if IsGuiObject(instance) then
+		local success, value = pcall(function() return instance.ZIndex end)
+		if success and tonumber(value) then return tonumber(value) end
+	end
+	return tonumber(fallback) or 1
+end
+
+local function SafeSetProperty(instance, property, value)
+	if typeof(instance) ~= "Instance" then return false, "Instance is unavailable." end
+	local success, err = pcall(function() instance[property] = value end)
+	if not success then
+		Luna._Stats.RuntimeErrors += 1
+		WarnOnce("property:" .. tostring(instance) .. ":" .. tostring(property),
+			("Unable to set %s.%s: %s"):format(instance:GetFullName(), tostring(property), tostring(err)))
+	end
+	return success, err
+end
+
+local function ResolvePath(root, path)
+	local current = root
+	for segment in tostring(path or ""):gmatch("[^%.]+") do
+		if typeof(current) ~= "Instance" then return nil end
+		current = current:FindFirstChild(segment)
+		if not current then return nil end
+	end
+	return current
+end
+
+local function ValidateInstancePath(root, path, expectedClass)
+	local instance = ResolvePath(root, path)
+	if not instance then
+		return false, ("Missing UI asset path %q."):format(path)
+	end
+	if expectedClass and not instance:IsA(expectedClass) then
+		return false, ("UI asset path %q must be %s, found %s."):format(
+			path, expectedClass, instance.ClassName
+		)
+	end
+	return true, instance
+end
+
+local function RemoveTrackedConnection(connection, bucket)
+	if typeof(connection) ~= "RBXScriptConnection" then return false end
+	pcall(function() connection:Disconnect() end)
+	Luna._Connections[connection] = nil
+	if type(bucket) == "table" then
+		for index = #bucket, 1, -1 do
+			if bucket[index] == connection then table.remove(bucket, index) end
+		end
+	end
+	return true
 end
 
 local function ConnectComponent(component, signal, callback)
 	component._Connections = component._Connections or {}
-	return TrackConnection(signal:Connect(callback), component._Connections)
+	if typeof(signal) ~= "RBXScriptSignal" or type(callback) ~= "function" then
+		Luna._Stats.ConnectionErrors += 1
+		WarnOnce("component-signal:" .. tostring(component), "Unable to connect an invalid component signal.")
+		return nil
+	end
+	local success, connection = pcall(function() return signal:Connect(callback) end)
+	if not success or typeof(connection) ~= "RBXScriptConnection" then
+		Luna._Stats.ConnectionErrors += 1
+		WarnOnce("component-connect:" .. tostring(component) .. ":" .. tostring(connection),
+			"Component signal connection failed: " .. tostring(connection))
+		return nil
+	end
+	return TrackConnection(connection, component._Connections)
 end
 
 local function IsComponentUsable(component)
@@ -136,16 +308,69 @@ local function SanitizeFileName(name)
 	return name:sub(1, 80)
 end
 
+local function NormalizeFolderPath(path)
+	local segments = {}
+	for rawSegment in tostring(path or ""):gmatch("[^/\\]+") do
+		local segment = rawSegment:gsub("^%s+", ""):gsub("%s+$", "")
+		if segment == "." or segment == ".." then
+			return nil, "Folder traversal segments are not allowed."
+		end
+		segment = segment:gsub("[%c]", ""):gsub('[:*?"<>|]', "_")
+		if segment ~= "" then table.insert(segments, segment:sub(1, 80)) end
+	end
+	if #segments == 0 then return nil, "Folder path is empty." end
+	return table.concat(segments, "/")
+end
+
+local function JoinFolderPath(root, child)
+	local combined = (root ~= nil and tostring(root) ~= "")
+		and (tostring(root) .. "/" .. tostring(child or ""))
+		or tostring(child or "")
+	return NormalizeFolderPath(combined)
+end
+
+local function SafeIsFile(path)
+	if type(isfile) ~= "function" then return nil, "Executor does not support isfile." end
+	local success, result = pcall(isfile, path)
+	if not success then
+		Luna._Stats.FilesystemErrors += 1
+		return nil, tostring(result)
+	end
+	return result == true
+end
+
+local function SafeReadFile(path)
+	if type(readfile) ~= "function" then return false, "Executor does not support readfile." end
+	local success, result = pcall(readfile, path)
+	if not success then Luna._Stats.FilesystemErrors += 1 end
+	return success, result
+end
+
+local function SafeDeleteFile(path)
+	if type(delfile) ~= "function" then return false, "Executor does not support delfile." end
+	local success, result = pcall(delfile, path)
+	if not success then Luna._Stats.FilesystemErrors += 1 end
+	return success, result
+end
+
 local function EnsureFolderPath(path)
 	if type(isfolder) ~= "function" or type(makefolder) ~= "function" then
 		return false, "Executor does not support folders."
 	end
+	local normalized, normalizeError = NormalizeFolderPath(path)
+	if not normalized then return false, normalizeError end
 	local current = ""
-	for segment in tostring(path):gmatch("[^/\\]+") do
+	for segment in normalized:gmatch("[^/]+") do
 		current = current == "" and segment or (current .. "/" .. segment)
-		if not isfolder(current) then
+		local checkSuccess, exists = pcall(isfolder, current)
+		if not checkSuccess then
+			Luna._Stats.FilesystemErrors += 1
+			return false, tostring(exists)
+		end
+		if not exists then
 			local success, err = pcall(makefolder, current)
 			if not success then
+				Luna._Stats.FilesystemErrors += 1
 				return false, tostring(err)
 			end
 		end
@@ -548,11 +773,14 @@ function Luna:On(name, callback)
 end
 
 function Luna:Off(connection)
-	if connection and type(connection.Disconnect) == "function" then
-		connection.Disconnect()
-		return true
+	if not connection or type(connection.Disconnect) ~= "function" then return false end
+	local success, err = pcall(function() connection:Disconnect() end)
+	if typeof(connection) == "RBXScriptConnection" then Luna._Connections[connection] = nil end
+	if not success then
+		Luna._Stats.ConnectionErrors += 1
+		WarnOnce("off:" .. tostring(connection), "Unable to disconnect listener: " .. tostring(err))
 	end
-	return false
+	return success, err
 end
 
 function Luna:Once(name, callback)
@@ -619,18 +847,28 @@ function Luna:SetValue(flag, value, silent)
 	if not option or type(option.SetValue) ~= "function" then
 		return false, "Option does not support SetValue."
 	end
-	option:SetValue(value, silent == true)
+	local success, result = pcall(option.SetValue, option, value, silent == true)
+	if not success then
+		Luna._Stats.RuntimeErrors += 1
+		return false, tostring(result)
+	end
+	if result == false then return false, "Option rejected the supplied value." end
 	return true, option
 end
 
 function Luna:SetValues(values, silent)
 	if type(values) ~= "table" then return false, "Values must be a table." end
-	local errors = {}
-	for flag, value in pairs(values) do
-		local success, result = self:SetValue(flag, value, silent == true)
-		if not success then errors[tostring(flag)] = result end
+	local flags = {}
+	for flag in pairs(values) do table.insert(flags, tostring(flag)) end
+	table.sort(flags, function(a, b) return a:lower() < b:lower() end)
+	local errors, applied = {}, {}
+	for _, flag in ipairs(flags) do
+		local success, result = self:SetValue(flag, values[flag], silent == true)
+		if success then table.insert(applied, flag) else errors[flag] = result end
 	end
-	return next(errors) == nil, errors
+	NormalizeAllToggleGroups(false)
+	EmitEvent("ValuesApplied", applied, errors)
+	return next(errors) == nil, errors, applied
 end
 
 function Luna:ResetOption(flag, silent)
@@ -643,16 +881,20 @@ function Luna:ResetOption(flag, silent)
 end
 
 function Luna:ResetAll(silent)
-	local resetCount = 0
-	for _, option in pairs(Luna.Options) do
-		if type(option.Reset) == "function" then
-			option:Reset(silent == true)
-			resetCount += 1
+	local flags = {}
+	for flag in pairs(Luna.Options) do table.insert(flags, tostring(flag)) end
+	table.sort(flags, function(a, b) return a:lower() < b:lower() end)
+	local resetCount, errors = 0, {}
+	for _, flag in ipairs(flags) do
+		local option = Luna.Options[flag]
+		if option and type(option.Reset) == "function" then
+			local success, result = pcall(option.Reset, option, silent == true)
+			if success then resetCount += 1 else errors[flag] = tostring(result) end
 		end
 	end
 	NormalizeAllToggleGroups(false)
-	EmitEvent("AllOptionsReset", resetCount)
-	return true, resetCount
+	EmitEvent("AllOptionsReset", resetCount, errors)
+	return next(errors) == nil, resetCount, errors
 end
 
 local ValueComponentClasses = {
@@ -670,6 +912,17 @@ local function StoreOriginalBoolean(instance, attributeName, value)
 	end
 end
 
+local function DependencyWouldCycle(target, source, visited)
+	if target == source then return true end
+	visited = visited or {}
+	if visited[source] then return false end
+	visited[source] = true
+	for upstream in pairs(type(source) == "table" and source._DependencySources or {}) do
+		if DependencyWouldCycle(target, upstream, visited) then return true end
+	end
+	return false
+end
+
 local function EnhanceComponent(component)
 	if type(component) ~= "table" then
 		return component
@@ -680,6 +933,7 @@ local function EnhanceComponent(component)
 	component.Disabled = component.Disabled == true
 	component._Destroyed = component._Destroyed == true
 	component._Connections = component._Connections or {}
+	component._CreatedAt = component._CreatedAt or os.clock()
 
 	if ValueComponentClasses[component.Class]
 		and component.Set
@@ -742,73 +996,84 @@ local function EnhanceComponent(component)
 		function component:SetDisabled(disabled)
 			if self._Destroyed then return self end
 			disabled = disabled == true
+			if self.Disabled == disabled and self._DisabledStateApplied == true then
+				return self
+			end
+
 			self.Disabled = disabled
+			self._DisabledStateApplied = true
+			self._DisabledSnapshot = self._DisabledSnapshot
+				or setmetatable({}, {__mode = "k"})
 			local object = self._Object
 
-			if object then
+			if object and object.Parent then
 				object:SetAttribute("LunaDisabled", disabled)
 				local descendants = object:GetDescendants()
 				table.insert(descendants, object)
 
 				for _, item in ipairs(descendants) do
-					if item:IsA("GuiButton") then
-						StoreOriginalBoolean(item, "LunaOriginalActive", item.Active)
-						StoreOriginalBoolean(item, "LunaOriginalAutoButtonColor", item.AutoButtonColor)
-						if disabled then
-							item.Active = false
-							item.AutoButtonColor = false
-						else
-							item.Active = item:GetAttribute("LunaOriginalActive") == true
-							item.AutoButtonColor =
-								item:GetAttribute("LunaOriginalAutoButtonColor") == true
-						end
-					elseif item:IsA("TextBox") then
-						StoreOriginalBoolean(item, "LunaOriginalTextEditable", item.TextEditable)
-						item.TextEditable = disabled
-							and false
-							or item:GetAttribute("LunaOriginalTextEditable") == true
+					local state = self._DisabledSnapshot[item]
+					if disabled and not state then
+						state = {}
+						self._DisabledSnapshot[item] = state
 					end
 
-					if item:IsA("TextLabel")
-						or item:IsA("TextButton")
-						or item:IsA("TextBox")
-					then
-						local attribute = "LunaOriginalTextTransparency"
+					if item:IsA("GuiButton") then
 						if disabled then
-							if item:GetAttribute(attribute) == nil then
-								item:SetAttribute(attribute, item.TextTransparency)
-							end
-							local original = item:GetAttribute(attribute) or 0
-							item.TextTransparency = math.max(original, 0.45)
-						else
-							local original = item:GetAttribute(attribute)
-							if original ~= nil then item.TextTransparency = original end
+							state.Active = item.Active
+							state.AutoButtonColor = item.AutoButtonColor
+							item.Active = false
+							item.AutoButtonColor = false
+						elseif state then
+							if state.Active ~= nil then item.Active = state.Active end
+							if state.AutoButtonColor ~= nil then item.AutoButtonColor = state.AutoButtonColor end
 						end
-					elseif item:IsA("ImageLabel") or item:IsA("ImageButton") then
-						local attribute = "LunaOriginalImageTransparency"
+					elseif item:IsA("TextBox") then
 						if disabled then
-							if item:GetAttribute(attribute) == nil then
-								item:SetAttribute(attribute, item.ImageTransparency)
-							end
-							local original = item:GetAttribute(attribute) or 0
-							item.ImageTransparency = math.max(original, 0.45)
-						else
-							local original = item:GetAttribute(attribute)
-							if original ~= nil then item.ImageTransparency = original end
-						end
-					elseif item:IsA("UIStroke") then
-						local attribute = "LunaOriginalStrokeTransparency"
-						if disabled then
-							if item:GetAttribute(attribute) == nil then
-								item:SetAttribute(attribute, item.Transparency)
-							end
-							local original = item:GetAttribute(attribute) or 0
-							item.Transparency = math.max(original, 0.7)
-						else
-							local original = item:GetAttribute(attribute)
-							if original ~= nil then item.Transparency = original end
+							state.TextEditable = item.TextEditable
+							item.TextEditable = false
+						elseif state and state.TextEditable ~= nil then
+							item.TextEditable = state.TextEditable
 						end
 					end
+
+					-- Entrance animations often begin at transparency 1. Never store that
+					-- temporary value as the permanent enabled appearance.
+					if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+						if disabled then
+							local current = tonumber(item.TextTransparency) or 0
+							if current < 0.98 then
+								state.TextTransparency = current
+								item.TextTransparency = math.max(current, 0.45)
+							end
+						elseif state and state.TextTransparency ~= nil then
+							item.TextTransparency = state.TextTransparency
+						end
+					elseif item:IsA("ImageLabel") or item:IsA("ImageButton") then
+						if disabled then
+							local current = tonumber(item.ImageTransparency) or 0
+							if current < 0.98 then
+								state.ImageTransparency = current
+								item.ImageTransparency = math.max(current, 0.45)
+							end
+						elseif state and state.ImageTransparency ~= nil then
+							item.ImageTransparency = state.ImageTransparency
+						end
+					elseif item:IsA("UIStroke") then
+						if disabled then
+							local current = tonumber(item.Transparency) or 0
+							if current < 0.98 then
+								state.StrokeTransparency = current
+								item.Transparency = math.max(current, 0.7)
+							end
+						elseif state and state.StrokeTransparency ~= nil then
+							item.Transparency = state.StrokeTransparency
+						end
+					end
+				end
+
+				if not disabled then
+					table.clear(self._DisabledSnapshot)
 				end
 			end
 			return self
@@ -878,6 +1143,7 @@ end
 if component._DefaultValue == nil and ValueComponentClasses[component.Class] then
 	component._DefaultValue = DeepCopy(ReadComponentValue(component))
 	component._LastEmittedValue = DeepCopy(component._DefaultValue)
+	component._LastEmittedInitialized = true
 end
 
 if not component.Reset then
@@ -913,6 +1179,10 @@ if not component.DependsOn then
 		if not source or type(source.GetValue) ~= "function" or type(source.OnChanged) ~= "function" then
 			return nil, "Dependency source is invalid."
 		end
+		if DependencyWouldCycle(self, source) then
+			Luna._Stats.DependencyCyclesRejected += 1
+			return nil, "Dependency cycle was rejected."
+		end
 
 		if type(expected) == "table" and options == nil then
 			options = expected
@@ -923,13 +1193,16 @@ if not component.DependsOn then
 
 		local function matches(value)
 			if type(expected) == "function" then
-				local success, result = pcall(expected, value, source, self)
+				local success, result = SafeCall(expected, value, source, self)
 				return success and result == true
 			end
 			return ValuesEqual(value, expected)
 		end
 
+		local applying = false
 		local function apply(value)
+			if applying or self._Destroyed then return false end
+			applying = true
 			local active = matches(value)
 			if options.Invert == true then active = not active end
 			if options.Visible ~= false then self:SetVisible(active) end
@@ -937,16 +1210,28 @@ if not component.DependsOn then
 			if type(options.Callback) == "function" then
 				SafeCall(options.Callback, active, value, self, source)
 			end
+			applying = false
 			return active
 		end
 
-		local connection = source:OnChanged(function(value)
-			apply(value)
-		end)
+		local rawConnection = source:OnChanged(function(value) apply(value) end)
+		if not rawConnection then return nil, "Unable to subscribe to dependency source." end
 		self._DependencyConnections = self._DependencyConnections or {}
+		self._DependencySources = self._DependencySources or setmetatable({}, {__mode = "k"})
+		self._DependencySources[source] = true
+		local disconnected = false
+		local connection = {
+			Disconnect = function()
+				if disconnected then return end
+				disconnected = true
+				Luna:Off(rawConnection)
+				if self._DependencySources then self._DependencySources[source] = nil end
+			end,
+		}
 		table.insert(self._DependencyConnections, connection)
 		Luna._Stats.DependencyLinks += 1
-		apply(source:GetValue())
+		local valueSuccess, currentValue = pcall(source.GetValue, source)
+		if valueSuccess then apply(currentValue) else connection:Disconnect(); return nil, tostring(currentValue) end
 		return connection
 	end
 end
@@ -955,18 +1240,31 @@ end
 		local originalDestroy = component.Destroy
 		component._DestroyWrapped = true
 		function component:Destroy(...)
-			if self._Destroyed then return end
+			if self._Destroyed then return true end
 			self._Destroyed = true
+			HideTooltip(self)
 			if self._SearchEntry and self._Window and self._Window._SearchEntries then
 				self._Window._SearchEntries[self._SearchEntry.Id] = nil
 			end
 			for _, dependency in ipairs(self._DependencyConnections or {}) do
-				if dependency and type(dependency.Disconnect) == "function" then pcall(dependency.Disconnect) end
+				if dependency and type(dependency.Disconnect) == "function" then
+					pcall(function() dependency:Disconnect() end)
+				end
 			end
 			table.clear(self._DependencyConnections or {})
+			if self._DependencySources then table.clear(self._DependencySources) end
+			table.clear(self._ChangedListeners or {})
 			DisconnectConnections(self._Connections)
+			RemoveOption(self)
 			Luna._Components[self] = nil
-			return originalDestroy(self, ...)
+			local success, result = pcall(originalDestroy, self, ...)
+			if not success then
+				Luna._Stats.RuntimeErrors += 1
+				WarnOnce("destroy:" .. tostring(self),
+					"Component destroy failed: " .. tostring(result))
+				return false, result
+			end
+			return true, result
 		end
 	end
 
@@ -1005,6 +1303,25 @@ function Luna:GetDiagnostics()
 		ModalsOpened = Luna._Stats.ModalsOpened,
 		CommandPaletteSearches = Luna._Stats.CommandPaletteSearches,
 		DependencyLinks = Luna._Stats.DependencyLinks,
+		RuntimeErrors = Luna._Stats.RuntimeErrors,
+		RuntimeWarnings = Luna._Stats.RuntimeWarnings,
+		AssetValidationFailures = Luna._Stats.AssetValidationFailures,
+		ConfigWriteRecoveries = Luna._Stats.ConfigWriteRecoveries,
+		StatusUpdates = Luna._Stats.StatusUpdates,
+		ConnectionErrors = Luna._Stats.ConnectionErrors,
+		AsyncTasksStarted = Luna._Stats.AsyncTasksStarted,
+		AsyncTasksCompleted = Luna._Stats.AsyncTasksCompleted,
+		AsyncTasksCancelled = Luna._Stats.AsyncTasksCancelled,
+		ActiveAsyncTasks = Luna._Stats.ActiveAsyncTasks,
+		DependencyCyclesRejected = Luna._Stats.DependencyCyclesRejected,
+		TweenCancellations = Luna._Stats.TweenCancellations,
+		BlurFallbacks = Luna._Stats.BlurFallbacks,
+		DragClamps = Luna._Stats.DragClamps,
+		FilesystemErrors = Luna._Stats.FilesystemErrors,
+		ConfigRepairs = Luna._Stats.ConfigRepairs,
+		OverlayCleanups = Luna._Stats.OverlayCleanups,
+		DuplicateWindowRequests = Luna._Stats.DuplicateWindowRequests,
+		ActiveOverlays = (function() local count = 0 for overlay in pairs(Luna._Overlays) do if overlay and not overlay.Closed then count += 1 end end return count end)(),
 		NotificationHistory = #Luna._NotificationHistory,
 		RegisteredThemes = (function() local count = 0 for _ in pairs(Luna._Themes) do count += 1 end return count end)(),
 		ToggleGroups = groupCount,
@@ -1013,6 +1330,8 @@ function Luna:GetDiagnostics()
 		WindowBlurEnabled = Luna.WindowBlurEnabled,
 		StrictConfig = Luna.StrictConfig,
 		ConfigVersion = Luna.ConfigVersion,
+		MaxConfigBytes = Luna.MaxConfigBytes,
+		MaxConfigObjects = Luna.MaxConfigObjects,
 	}
 end
 
@@ -2509,7 +2828,11 @@ local IconModule = {
 }
 
 -- Other Variables
-local request = (syn and syn.request) or (http and http.request) or http_request or nil
+local request =
+	(type(syn) == "table" and type(syn.request) == "function" and syn.request)
+	or (type(http) == "table" and type(http.request) == "function" and http.request)
+	or (type(http_request) == "function" and http_request)
+	or nil
 local tweeninfo = TweenInfo.new(0.3, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out)
 local PresetGradients = {
 	["Nightlight (Classic)"] = {Color3.fromRGB(147, 255, 239), Color3.fromRGB(201,211,233), Color3.fromRGB(255, 167, 227)},
@@ -2663,7 +2986,7 @@ local function UseFallbackIcon(imageObject)
 end
 
 local function PreloadIcon(imageObject)
-	task.defer(function()
+	ManagedDefer(function()
 		if Luna._Destroyed or not imageObject or not imageObject.Parent then return end
 
 		local originalImage = imageObject.Image
@@ -2782,11 +3105,15 @@ function Luna:GetIconDebugInfo(imageObject)
 end
 
 local function RemoveTable(tablre, value)
-	for i,v in pairs(tablre) do
-		if tostring(v) == tostring(value) then
-			table.remove(tablre, i)
+	if type(tablre) ~= "table" then return 0 end
+	local removed = 0
+	for index = #tablre, 1, -1 do
+		if tostring(tablre[index]) == tostring(value) then
+			table.remove(tablre, index)
+			removed += 1
 		end
 	end
+	return removed
 end
 
 local function Kwargify(defaults, passed)
@@ -2828,27 +3155,61 @@ local function TweenGoalKey(goal)
 	table.sort(keys)
 	return table.concat(keys, "|")
 end
+
+local function CancelAllTrackedTweens()
+	local cancelled = 0
+	for object, bucket in pairs(ActiveTweens) do
+		for key, animation in pairs(bucket) do
+			if animation then pcall(function() animation:Cancel() end); cancelled += 1 end
+			bucket[key] = nil
+		end
+		ActiveTweens[object] = nil
+	end
+	Luna._Stats.TweenCancellations += cancelled
+	return cancelled
+end
+
 local function tween(object, goal, callback, tweenin)
-	if not object then return nil end
+	if typeof(object) ~= "Instance" or type(goal) ~= "table" or next(goal) == nil then return nil end
 	local bucket = ActiveTweens[object]
 	if not bucket then bucket = {}; ActiveTweens[object] = bucket end
 	local goalKey = TweenGoalKey(goal)
 	local previous = bucket[goalKey]
-	if previous then pcall(function() previous:Cancel() end) end
-	local animation = TweenService:Create(object, ScaleTweenInfo(tweenin), goal)
+	if previous then pcall(function() previous:Cancel() end); Luna._Stats.TweenCancellations += 1 end
+	local createSuccess, animation = pcall(TweenService.Create, TweenService, object, ScaleTweenInfo(tweenin), goal)
+	if not createSuccess or not animation then
+		Luna._Stats.RuntimeErrors += 1
+		WarnOnce("tween:" .. tostring(object) .. ":" .. goalKey, "Unable to create tween: " .. tostring(animation))
+		return nil
+	end
 	bucket[goalKey] = animation
 	animation.Completed:Once(function(...)
 		if bucket[goalKey] == animation then bucket[goalKey] = nil end
 		if next(bucket) == nil then ActiveTweens[object] = nil end
-		if type(callback) == "function" then callback(...) end
+		if type(callback) == "function" and not Luna._Destroyed then SafeCall(callback, ...) end
 	end)
-	animation:Play()
+	local playSuccess, playError = pcall(function() animation:Play() end)
+	if not playSuccess then
+		bucket[goalKey] = nil
+		Luna._Stats.RuntimeErrors += 1
+		WarnOnce("tween-play:" .. tostring(object) .. ":" .. goalKey, "Unable to play tween: " .. tostring(playError))
+		return nil
+	end
 	return animation
 end
 
 local function BlurModule(Frame)
 	local RunService = game:GetService('RunService')
-	local camera = workspace.CurrentCamera
+	if not IsGuiObject(Frame) then
+		Luna._Stats.BlurFallbacks += 1
+		return function() end
+	end
+	local camera = GetCurrentCamera()
+	if not camera then
+		Luna._Stats.BlurFallbacks += 1
+		WarnOnce("blur-no-camera", "Blur was skipped because CurrentCamera is unavailable.")
+		return function() end
+	end
 	local MTREL = "Glass"
 	local binds = {}
 	local root = Instance.new('Folder', camera)
@@ -2910,7 +3271,7 @@ local function BlurModule(Frame)
 			end
 
 			local para = ( (B-A).x*(C-A).x + (B-A).y*(C-A).y + (B-A).z*(C-A).z ) / (A-B).magnitude
-			local perp = sqrt((C-A).magnitude^2 - para*para)
+			local perp = sqrt(max(0, (C-A).magnitude^2 - para*para))
 			local dif_para = (A - B).magnitude - para
 
 			local st = CFrame.new(B, A)
@@ -2922,6 +3283,7 @@ local function BlurModule(Frame)
 			local Mid_Point = A + CFrame.new(A, B).lookVector * para
 			local Needed_Look = CFrame.new(Mid_Point, C).lookVector
 			local dot = Top_Look.x*Needed_Look.x + Top_Look.y*Needed_Look.y + Top_Look.z*Needed_Look.z
+			dot = math.clamp(dot, -1, 1)
 
 			local ac = CFrame.Angles(0, 0, acos(dot))
 
@@ -3010,7 +3372,7 @@ local function BlurModule(Frame)
 		for _, pt in pairs(parts) do
 			pt.Transparency = properties.Transparency
 		end
-		local zIndex = 1 - 0.05*frame.ZIndex
+		local zIndex = math.clamp(1 - 0.05 * GetGuiZIndex(frame, 1), 0.05, 0.95)
 
 		local tl, br = frame.AbsolutePosition, frame.AbsolutePosition + frame.AbsoluteSize
 		local tr, bl = Vector2.new(br.x, tl.y), Vector2.new(tl.x, br.y)
@@ -3029,13 +3391,19 @@ local function BlurModule(Frame)
 				br = Vector2.new(c*(br.x - mid.x) - s*(br.y - mid.y), s*(br.x - mid.x) + c*(br.y - mid.y)) + mid
 			end
 		end
-		DrawQuad(
-			camera:ScreenPointToRay(tl.x, tl.y, zIndex).Origin, 
-			camera:ScreenPointToRay(tr.x, tr.y, zIndex).Origin, 
-			camera:ScreenPointToRay(bl.x, bl.y, zIndex).Origin, 
-			camera:ScreenPointToRay(br.x, br.y, zIndex).Origin, 
+		local drawSuccess, drawError = pcall(DrawQuad,
+			camera:ScreenPointToRay(tl.x, tl.y, zIndex).Origin,
+			camera:ScreenPointToRay(tr.x, tr.y, zIndex).Origin,
+			camera:ScreenPointToRay(bl.x, bl.y, zIndex).Origin,
+			camera:ScreenPointToRay(br.x, br.y, zIndex).Origin,
 			parts
 		)
+		if not drawSuccess then
+			Luna._Stats.BlurFallbacks += 1
+			for _, pt in pairs(parts) do pt.Transparency = 1 end
+			WarnOnce("blur-draw:" .. tostring(uid), "Blur render failed and was hidden: " .. tostring(drawError))
+			return
+		end
 		if fetchProps then
 			for _, pt in pairs(parts) do
 				pt.Parent = f
@@ -3100,6 +3468,16 @@ then
 end
 
 local LunaUI = assetObjects[1]
+pcall(function()
+	LunaUI:SetAttribute("LunaLibraryOwned", true)
+	LunaUI:SetAttribute("LunaLibraryVersion", Release)
+	LunaUI:SetAttribute("LunaSessionId", Luna._SessionId)
+end)
+if not LunaUI:IsA("ScreenGui") then
+	Luna._Stats.AssetValidationFailures += 1
+	pcall(function() LunaUI:Destroy() end)
+	error(("Luna UI asset root must be ScreenGui, found %s."):format(LunaUI.ClassName))
+end
 local requiredChildren = {"SmartWindow", "Notifications", "Drag", "MobileSupport"}
 for _, childName in ipairs(requiredChildren) do
 	if not LunaUI:FindFirstChild(childName) then
@@ -3108,7 +3486,33 @@ for _, childName in ipairs(requiredChildren) do
 	end
 end
 
-GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = Luna
+local RequiredAssetPaths = {
+	{"SmartWindow", "GuiObject"},
+	{"SmartWindow.Controls", nil},
+	{"SmartWindow.Controls.Close.ImageLabel", "GuiButton"},
+	{"SmartWindow.Controls.ToggleSize.ImageLabel", "GuiButton"},
+	{"SmartWindow.Controls.Theme.ImageLabel", "GuiButton"},
+	{"SmartWindow.Title.Title", "GuiObject"},
+	{"SmartWindow.Title.subtitle", "GuiObject"},
+	{"SmartWindow.Logo", "GuiButton"},
+	{"SmartWindow.Elements.Interactions", nil},
+	{"SmartWindow.LoadingFrame", "GuiObject"},
+	{"SmartWindow.Navigation.Tabs", nil},
+	{"Notifications.Template", "GuiObject"},
+	{"Drag.Interact", "GuiButton"},
+	{"MobileSupport.Interact", "GuiButton"},
+	{"ThemeRemote", nil},
+}
+
+for _, requirement in ipairs(RequiredAssetPaths) do
+	local valid, result = ValidateInstancePath(LunaUI, requirement[1], requirement[2])
+	if not valid then
+		Luna._Stats.AssetValidationFailures += 1
+		pcall(function() LunaUI:Destroy() end)
+		error("Luna UI asset validation failed: " .. tostring(result))
+	end
+end
+
 
 local SavedWindowVisibilityState = setmetatable({}, {__mode = "k"})
 local LastHideNotificationAt = setmetatable({}, {__mode = "k"})
@@ -3194,18 +3598,38 @@ local function Hide(Window, bind, notif, notificationCooldown)
 end
 
 
-if gethui then
-	LunaUI.Parent = gethui()
-elseif syn and syn.protect_gui then 
-	syn.protect_gui(LunaUI)
-	LunaUI.Parent = CoreGui
-elseif CoreGui:FindFirstChild("RobloxGui") then
-	LunaUI.Parent = CoreGui:FindFirstChild("RobloxGui")
-else
-	LunaUI.Parent = CoreGui
+local interfaceParent
+if type(gethui) == "function" then
+	local success, result = pcall(gethui)
+	if success and typeof(result) == "Instance" then
+		interfaceParent = result
+	end
 end
 
-local interfaceParent = type(gethui) == "function" and gethui() or CoreGui
+if not interfaceParent
+	and type(syn) == "table"
+	and type(syn.protect_gui) == "function"
+then
+	pcall(syn.protect_gui, LunaUI)
+	interfaceParent = CoreGui
+end
+
+if not interfaceParent then
+	interfaceParent = CoreGui:FindFirstChild("RobloxGui") or CoreGui
+end
+
+local parentSuccess, parentError = pcall(function()
+	LunaUI.Parent = interfaceParent
+end)
+if not parentSuccess and interfaceParent ~= CoreGui then
+	interfaceParent = CoreGui
+	parentSuccess, parentError = pcall(function() LunaUI.Parent = CoreGui end)
+end
+if not parentSuccess then
+	pcall(function() LunaUI:Destroy() end)
+	error("Luna UI could not be parented: " .. tostring(parentError))
+end
+
 for _, Interface in ipairs(interfaceParent:GetChildren()) do
 	if Interface.Name == LunaUI.Name and Interface ~= LunaUI then
 		pcall(function()
@@ -3214,6 +3638,9 @@ for _, Interface in ipairs(interfaceParent:GetChildren()) do
 		end)
 	end
 end
+
+-- Register only after the asset is validated and parented successfully.
+GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = Luna
 
 LunaUI.Enabled = false
 LunaUI.SmartWindow.Visible = false
@@ -3427,7 +3854,7 @@ AttachTooltipToComponent = function(component, tooltip)
 		if input.UserInputType ~= Enum.UserInputType.Touch then return end
 		TooltipGeneration += 1
 		local generation = TooltipGeneration
-		task.delay(0.55, function()
+		ManagedDelay(0.55, function()
 			if generation == TooltipGeneration and not component._Destroyed and component.Tooltip then
 				ShowTooltip(component, component.Tooltip, input.Position)
 			end
@@ -3476,7 +3903,7 @@ local function FocusComponent(component)
 		local originalTransparency = stroke.Transparency
 		stroke.Color = Color3.fromRGB(190, 205, 255)
 		stroke.Transparency = 0
-		task.delay(0.65, function()
+		ManagedDelay(0.65, function()
 			if stroke and stroke.Parent then
 				stroke.Color = originalColor
 				stroke.Transparency = originalTransparency
@@ -4352,7 +4779,7 @@ local function EnhanceCollapsibleSection(section, settings)
 	-- Some UI assets update visibility during the same frame in which they are
 	-- cloned. Re-assert the expanded body once after creation so child controls
 	-- cannot remain hidden because of an initialization race.
-	task.defer(function()
+	ManagedDefer(function()
 		if not section._Destroyed and body and body.Parent and not section.Collapsed then
 			body.Visible = true
 			renderHeader()
@@ -4548,17 +4975,19 @@ local function CreateModalOverlay(window, data)
 	local cancel = data.ShowCancel ~= false and makeButton("Cancel", data.CancelText, false) or nil
 	local confirm = makeButton("Confirm", data.ConfirmText, true)
 
-	function handle:Close(result)
+	function handle:Close(result, closeOptions)
 		if self.Closed then return self.Result end
+		local silent = closeOptions == true or (type(closeOptions) == "table" and closeOptions.Silent == true)
 		self.Closed = true
 		self.Result = result
-		for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
-		table.clear(connections)
+		DisconnectConnections(connections)
 		if overlay.Parent then overlay:Destroy() end
+		Luna._Overlays[self] = nil
+		Luna._Stats.OverlayCleanups += 1
 		if window._ActiveModal == self then window._ActiveModal = nil end
 		resolved:Fire(result)
-		if type(data.Callback) == "function" then SafeCall(data.Callback, result, self) end
-		EmitEvent("ModalClosed", window, self, result)
+		if not silent and type(data.Callback) == "function" then SafeCall(data.Callback, result, self) end
+		if not silent then EmitEvent("ModalClosed", window, self, result) end
 		task.defer(function() resolved:Destroy() end)
 		return result
 	end
@@ -4578,20 +5007,21 @@ local function CreateModalOverlay(window, data)
 		return self
 	end
 
-	table.insert(connections, confirm.MouseButton1Click:Connect(function()
+	TrackConnection(confirm.MouseButton1Click:Connect(function()
 		handle:Close(inputBox and inputBox.Text or true)
-	end))
+	end), connections)
 	if cancel then
-		table.insert(connections, cancel.MouseButton1Click:Connect(function() handle:Close(false) end))
+		TrackConnection(cancel.MouseButton1Click:Connect(function() handle:Close(false) end), connections)
 	end
 	if data.CloseOnBackground then
-		table.insert(connections, background.MouseButton1Click:Connect(function() handle:Close(false) end))
+		TrackConnection(background.MouseButton1Click:Connect(function() handle:Close(false) end), connections)
 	end
-	table.insert(connections, UserInputService.InputBegan:Connect(function(input)
+	TrackConnection(UserInputService.InputBegan:Connect(function(input)
 		if handle.Closed then return end
 		if input.KeyCode == Enum.KeyCode.Escape then handle:Close(false) end
-	end))
-	if inputBox then task.defer(function() if inputBox.Parent then inputBox:CaptureFocus() end end) end
+	end), connections)
+	Luna._Overlays[handle] = true
+	if inputBox then ManagedDefer(function() if inputBox.Parent then pcall(function() inputBox:CaptureFocus() end) end end) end
 	EmitEvent("ModalOpened", window, handle, data)
 	return handle
 end
@@ -4693,6 +5123,7 @@ local function EnhanceWindowProductivity(window, settings)
 			return self._Palette
 		end
 		local palette = {Closed = false}
+		Luna._Overlays[palette] = true
 		local overlay = Instance.new("Frame")
 		overlay.Name = "LunaCommandPalette"
 		overlay.BackgroundColor3 = Color3.new(0, 0, 0)
@@ -4759,17 +5190,16 @@ local function EnhanceWindowProductivity(window, settings)
 		function palette:Close()
 			if self.Closed then return end
 			self.Closed = true
-			for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
-			for _, connection in ipairs(resultConnections) do pcall(function() connection:Disconnect() end) end
-			table.clear(connections)
-			table.clear(resultConnections)
+			DisconnectConnections(connections)
+			DisconnectConnections(resultConnections)
 			if overlay.Parent then overlay:Destroy() end
+			Luna._Overlays[self] = nil
+			Luna._Stats.OverlayCleanups += 1
 			window._Palette = nil
 			EmitEvent("CommandPaletteClosed", window)
 		end
 		function palette:Refresh()
-			for _, connection in ipairs(resultConnections) do pcall(function() connection:Disconnect() end) end
-			table.clear(resultConnections)
+			DisconnectConnections(resultConnections)
 			for _, child in ipairs(resultsFrame:GetChildren()) do
 				if child:IsA("GuiObject") then child:Destroy() end
 			end
@@ -4796,22 +5226,22 @@ local function EnhanceWindowProductivity(window, settings)
 				description.Size = UDim2.new(1, -24, 0, 17)
 				description.TextColor3 = ProductivityColors.Muted
 				description.ZIndex = 855
-				table.insert(resultConnections, button.MouseButton1Click:Connect(function()
+				TrackConnection(button.MouseButton1Click:Connect(function()
 					palette:Close()
 					if type(entry.Action) == "function" then SafeCall(entry.Action, entry) end
-				end))
+				end), resultConnections)
 			end
 		end
 		palette.Input = input
-		table.insert(connections, input:GetPropertyChangedSignal("Text"):Connect(function() palette:Refresh() end))
-		table.insert(connections, background.MouseButton1Click:Connect(function() palette:Close() end))
-		table.insert(connections, UserInputService.InputBegan:Connect(function(key)
+		TrackConnection(input:GetPropertyChangedSignal("Text"):Connect(function() palette:Refresh() end), connections)
+		TrackConnection(background.MouseButton1Click:Connect(function() palette:Close() end), connections)
+		TrackConnection(UserInputService.InputBegan:Connect(function(key)
 			if palette.Closed then return end
 			if key.KeyCode == Enum.KeyCode.Escape then palette:Close() end
-		end))
+		end), connections)
 		self._Palette = palette
 		palette:Refresh()
-		task.defer(function() if input.Parent then input:CaptureFocus() end end)
+		ManagedDefer(function() if input.Parent then input:CaptureFocus() end end)
 		EmitEvent("CommandPaletteOpened", self, palette)
 		return palette
 	end
@@ -5016,7 +5446,7 @@ end
 -- Legacy configuration code removed. JSON config v5 is defined below.
 
 local function Draggable(Bar, Window, enableTaptic, tapticOffset)
-	if not Bar or not Window then return function() end end
+	if not IsGuiObject(Bar) or not IsGuiObject(Window) then return function() end end
 	if Bar:GetAttribute("LunaDraggableConnected") then return function() end end
 	Bar:SetAttribute("LunaDraggableConnected", true)
 	local connections = {}
@@ -5026,8 +5456,41 @@ local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 	local FramePos
 	local inputEndedConnection
 
-	if not Bar or not Window then
-		return function() end
+	local function viewportSize()
+		local camera = GetCurrentCamera()
+		return camera and camera.ViewportSize or Vector2.new(1920, 1080)
+	end
+
+	local function clampPosition(position)
+		local viewport = viewportSize()
+		local size = Window.AbsoluteSize
+		if viewport.X <= 0 or viewport.Y <= 0 or size.X <= 0 or size.Y <= 0 then return position end
+		local visibleX = math.min(80, math.max(30, size.X * 0.25))
+		local visibleY = math.min(48, math.max(24, size.Y * 0.15))
+		local absoluteX = position.X.Scale * viewport.X + position.X.Offset
+		local absoluteY = position.Y.Scale * viewport.Y + position.Y.Offset
+		local clampedX = math.clamp(absoluteX, -size.X + visibleX, viewport.X - visibleX)
+		local clampedY = math.clamp(absoluteY, 0, viewport.Y - visibleY)
+		if clampedX ~= absoluteX or clampedY ~= absoluteY then Luna._Stats.DragClamps += 1 end
+		return UDim2.new(
+			position.X.Scale, clampedX - position.X.Scale * viewport.X,
+			position.Y.Scale, clampedY - position.Y.Scale * viewport.Y
+		)
+	end
+
+	local function finishDrag()
+		Dragging = false
+		DragInput, MousePos, FramePos = nil, nil, nil
+		if enableTaptic and dragBarCosmetic then
+			TweenService:Create(dragBarCosmetic, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+				Size = UDim2.new(0, 100, 0, 4),
+				BackgroundTransparency = 0.7,
+			}):Play()
+		end
+		if inputEndedConnection then
+			RemoveTrackedConnection(inputEndedConnection, connections)
+			inputEndedConnection = nil
+		end
 	end
 
 	if dragBar and enableTaptic then
@@ -5035,85 +5498,62 @@ local function Draggable(Bar, Window, enableTaptic, tapticOffset)
 			if not Dragging and dragBarCosmetic then
 				TweenService:Create(dragBarCosmetic, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 					BackgroundTransparency = 0.5,
-					Size = UDim2.new(0, 120, 0, 4)
+					Size = UDim2.new(0, 120, 0, 4),
 				}):Play()
 			end
 		end), connections)
-
 		TrackConnection(dragBar.MouseLeave:Connect(function()
 			if not Dragging and dragBarCosmetic then
 				TweenService:Create(dragBarCosmetic, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 					BackgroundTransparency = 0.7,
-					Size = UDim2.new(0, 100, 0, 4)
+					Size = UDim2.new(0, 100, 0, 4),
 				}):Play()
 			end
 		end), connections)
 	end
 
 	TrackConnection(Bar.InputBegan:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then
-			return
-		end
-
+		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+		finishDrag()
 		Dragging = true
 		MousePos = input.Position
 		FramePos = Window.Position
-
 		if enableTaptic and dragBarCosmetic then
 			TweenService:Create(dragBarCosmetic, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 				Size = UDim2.new(0, 110, 0, 4),
-				BackgroundTransparency = 0
+				BackgroundTransparency = 0,
 			}):Play()
 		end
-
-		if inputEndedConnection then
-			pcall(function() inputEndedConnection:Disconnect() end)
-		end
 		inputEndedConnection = TrackConnection(input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				Dragging = false
-				if enableTaptic and dragBarCosmetic then
-					TweenService:Create(dragBarCosmetic, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-						Size = UDim2.new(0, 100, 0, 4),
-						BackgroundTransparency = 0.7
-					}):Play()
-				end
-			end
+			if input.UserInputState == Enum.UserInputState.End then finishDrag() end
 		end), connections)
 	end), connections)
 
 	TrackConnection(Bar.InputChanged:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			DragInput = input
-		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then DragInput = input end
 	end), connections)
 
 	TrackConnection(UserInputService.InputChanged:Connect(function(input)
-		if input ~= DragInput or not Dragging or not MousePos or not FramePos then
-			return
-		end
-
+		if input ~= DragInput or not Dragging or not MousePos or not FramePos then return end
 		local delta = input.Position - MousePos
-		local newPosition = UDim2.new(
-			FramePos.X.Scale,
-			FramePos.X.Offset + delta.X,
-			FramePos.Y.Scale,
-			FramePos.Y.Offset + delta.Y
-		)
+		local newPosition = clampPosition(UDim2.new(
+			FramePos.X.Scale, FramePos.X.Offset + delta.X,
+			FramePos.Y.Scale, FramePos.Y.Offset + delta.Y
+		))
 		Window.Position = newPosition
-
 		if dragBar then
 			dragBar.Position = UDim2.new(
-				FramePos.X.Scale,
-				FramePos.X.Offset + delta.X,
-				FramePos.Y.Scale,
-				FramePos.Y.Offset + delta.Y + (tonumber(tapticOffset) or 240)
+				newPosition.X.Scale, newPosition.X.Offset,
+				newPosition.Y.Scale, newPosition.Y.Offset + (tonumber(tapticOffset) or 240)
 			)
 		end
 	end), connections)
 
+	local cleaned = false
 	local function cleanup()
-		Dragging = false
+		if cleaned then return end
+		cleaned = true
+		finishDrag()
 		pcall(function() Bar:SetAttribute("LunaDraggableConnected", nil) end)
 		DisconnectConnections(connections)
 	end
@@ -5174,7 +5614,7 @@ local function CloseNotificationRecord(record, immediate)
 		}):Play()
 	end)
 
-	task.delay(0.3, function()
+	ManagedDelay(0.3, function()
 		if notification and notification.Parent then
 			notification.Visible = false
 			pcall(function() notification:Destroy() end)
@@ -5366,7 +5806,7 @@ function Luna:Notification(data) -- rich notification with actions, progress and
 		Luna._NotificationById[generatedId] = handle
 	end
 
-	task.spawn(function()
+	ManagedSpawn(function()
 		if Luna._Destroyed or handle.Closed then return end
 		local maximum = math.max(1, math.floor(tonumber(data.MaxNotifications or Luna.MaxNotifications) or 3))
 		while #Luna._NotificationQueue >= maximum do
@@ -5644,6 +6084,12 @@ end
 
 
 function Luna:CreateWindow(WindowSettings)
+	if Luna._Destroyed then error("Cannot create a window from a destroyed Luna instance.") end
+	if Luna._PrimaryWindow then
+		Luna._Stats.DuplicateWindowRequests += 1
+		WarnOnce("duplicate-window", "CreateWindow was called more than once; returning the existing Luna window.")
+		return Luna._PrimaryWindow
+	end
 
 	WindowSettings = Kwargify({
 		Name = "Luna UI Example Window",
@@ -5682,10 +6128,15 @@ function Luna:CreateWindow(WindowSettings)
 		Separator = "  •  ",
 	}, WindowSettings.StatusDisplay or {})
 
-	if WindowSettings.ConfigSettings.RootFolder ~= nil and WindowSettings.ConfigSettings.RootFolder ~= "" then
-		Luna.Folder = tostring(WindowSettings.ConfigSettings.RootFolder) .. "/" .. tostring(WindowSettings.ConfigSettings.ConfigFolder)
+	local configuredFolder, configuredFolderError = JoinFolderPath(
+		WindowSettings.ConfigSettings.RootFolder,
+		WindowSettings.ConfigSettings.ConfigFolder
+	)
+	if configuredFolder then
+		Luna.Folder = configuredFolder
 	else
-		Luna.Folder = tostring(WindowSettings.ConfigSettings.ConfigFolder)
+		Luna.Folder = "Luna"
+		WarnOnce("config-folder", "Invalid config folder; using Luna: " .. tostring(configuredFolderError))
 	end
 
 	local minimizeBinding, minimizeBindingError = NormalizeInputBinding(
@@ -5786,16 +6237,9 @@ function Luna:CreateWindow(WindowSettings)
 	StatusDisplay.TextSize = 11
 	StatusDisplay.Active = false
 	StatusDisplay.Selectable = false
-	-- Main.Controls / Control is a Folder in the current Luna asset, so it has no ZIndex.
-	-- Read the layer only from real GuiObjects and keep a safe fallback.
-	local statusBaseZIndex = 1
-	local statusSubtitle = Main:FindFirstChild("Title")
-		and Main.Title:FindFirstChild("subtitle")
-	if statusSubtitle and statusSubtitle:IsA("GuiObject") then
-		statusBaseZIndex = statusSubtitle.ZIndex
-	elseif Main:IsA("GuiObject") then
-		statusBaseZIndex = Main.ZIndex
-	end
+	-- Never assume containers such as Controls are GuiObjects.
+	local statusSubtitle = ResolvePath(Main, "Title.subtitle")
+	local statusBaseZIndex = GetGuiZIndex(statusSubtitle, GetGuiZIndex(Main, 1))
 	StatusDisplay.ZIndex = math.max(20, statusBaseZIndex + 1)
 	StatusDisplay.TextTransparency = 1
 	StatusDisplay.Visible = WindowSettings.StatusDisplay.Enabled ~= false
@@ -5927,17 +6371,39 @@ function Luna:CreateWindow(WindowSettings)
 		statusElapsed = 0
 	end
 
+	Luna._Stats.RenderLoops += 1
+	local statusLoopCounted = true
+	AddCleanup(function()
+		if statusLoopCounted then
+			statusLoopCounted = false
+			Luna._Stats.RenderLoops = math.max(0, Luna._Stats.RenderLoops - 1)
+		end
+	end)
 	TrackConnection(RunService.RenderStepped:Connect(function(deltaTime)
 		if Luna._Destroyed then return end
-		statusFrameCount += 1
-		statusElapsed += math.max(0, tonumber(deltaTime) or 0)
-		local interval = math.max(
-			0.2,
-			tonumber(Window.StatusDisplaySettings.UpdateInterval) or 0.5
-		)
-		if statusElapsed >= interval then
-			Window.CurrentFPS = math.max(0, math.floor((statusFrameCount / math.max(statusElapsed, 0.001)) + 0.5))
+		local settings = Window.StatusDisplaySettings
+		if settings.Enabled == false or not Window.State then
 			ResetStatusSample()
+			return
+		end
+		local showFPS = settings.ShowFPS ~= false
+		local showClock = settings.ShowClock ~= false
+		if not showFPS and not showClock then
+			ResetStatusSample()
+			return
+		end
+		if showFPS then statusFrameCount += 1 end
+		statusElapsed += math.clamp(tonumber(deltaTime) or 0, 0, 1)
+		local interval = math.max(0.2, tonumber(settings.UpdateInterval) or 0.5)
+		if statusElapsed >= interval then
+			if showFPS then
+				Window.CurrentFPS = math.clamp(
+					math.floor((statusFrameCount / math.max(statusElapsed, 0.001)) + 0.5),
+					0, 1000
+				)
+			end
+			ResetStatusSample()
+			Luna._Stats.StatusUpdates += 1
 			RefreshStatusDisplay()
 		end
 	end))
@@ -5962,10 +6428,10 @@ function Luna:CreateWindow(WindowSettings)
 	end
 	TrackConnection(Main.Controls.ChildAdded:Connect(function(control)
 		TrackStatusControlLayout(control)
-		task.defer(RefreshStatusLayout)
+		ManagedDefer(RefreshStatusLayout)
 	end))
 	TrackConnection(Main.Controls.ChildRemoved:Connect(function()
-		task.defer(RefreshStatusLayout)
+		ManagedDefer(RefreshStatusLayout)
 	end))
 
 	function Window:SetStatusDisplayEnabled(enabled)
@@ -6026,7 +6492,7 @@ function Luna:CreateWindow(WindowSettings)
 	Main.Title.Title.Text = WindowSettings.Name
 	Main.Title.subtitle.Text = WindowSettings.Subtitle
 	Main.Logo.Image = "rbxassetid://" .. WindowSettings.LogoID
-	task.defer(RefreshStatusLayout)
+	ManagedDefer(RefreshStatusLayout)
 	Main.Visible = true
 	Main.BackgroundTransparency = 1
 	Main.Size = MainSize
@@ -6569,7 +7035,7 @@ function Luna:CreateWindow(WindowSettings)
 			discordLogo.ZIndex = baseZIndex + 6
 			discordLogo.Parent = logoHolder
 
-			task.spawn(function()
+			ManagedSpawn(function()
 				local started = os.clock()
 
 				while discordLogo.Parent
@@ -6718,11 +7184,11 @@ function Luna:CreateWindow(WindowSettings)
 		setPlayerCounts()
 		TrackConnection(Players.PlayerAdded:Connect(setPlayerCounts), homeConnections)
 		TrackConnection(Players.PlayerRemoving:Connect(function()
-			task.defer(setPlayerCounts)
+			ManagedDefer(setPlayerCounts)
 		end), homeConnections)
 
 		local region = "Unknown"
-		task.spawn(function()
+		ManagedSpawn(function()
 			local success, result = pcall(Localization.GetCountryRegionForPlayerAsync, Localization, Player)
 			if success and result then region = tostring(result) end
 			if alive and HomeTabPage.Parent then
@@ -6751,7 +7217,7 @@ function Luna:CreateWindow(WindowSettings)
 		local function checkFriends()
 			if checkingFriends or not alive then return end
 			checkingFriends = true
-			task.spawn(function()
+			ManagedSpawn(function()
 				local playersFriends = {}
 				local friendsInTotal, onlineFriends, friendsInGame = 0, 0, 0
 				local success = pcall(function()
@@ -6781,7 +7247,7 @@ function Luna:CreateWindow(WindowSettings)
 		end
 
 		checkFriends()
-		task.spawn(function()
+		ManagedSpawn(function()
 			local friendElapsed = tonumber(HomeTabSettings.FriendsRefreshInterval) or 30
 			while alive and not Luna._Destroyed and HomeTabPage.Parent do
 				HomeTabPage.detailsholder.dashboard.Server.Latency.Value.Text = tostring(math.floor(getPing())) .. "ms"
@@ -7394,7 +7860,7 @@ function Luna:CreateWindow(WindowSettings)
 				if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then
 					emitCallback(SliderV.CurrentValue, true)
 				end
-				task.defer(function()
+				ManagedDefer(function()
 					if Slider.Parent then
 						setProgress(tonumber(SliderSettings.CurrentValue) or 0)
 					end
@@ -7481,7 +7947,7 @@ function Luna:CreateWindow(WindowSettings)
 					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
 					TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 					Toggle.Title.Text = "Callback Error"
-					task.delay(0.5, function()
+					ManagedDelay(0.5, function()
 						if not Toggle.Parent then return end
 						Toggle.Title.Text = tostring(ToggleSettings.Name)
 						TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
@@ -7664,7 +8130,7 @@ function Luna:CreateWindow(WindowSettings)
 					false,
 					true
 				)
-				task.defer(function()
+				ManagedDefer(function()
 					if not ToggleV._Destroyed then
 						NormalizeAllToggleGroups(false)
 					end
@@ -8246,8 +8712,8 @@ function Luna:CreateWindow(WindowSettings)
 						local value = DropdownSettings.MultipleOptions and DropdownSettings.CurrentOption or DropdownSettings.CurrentOption[1]
 						SafeCallback(value)
 					end
-					TrackConnection(Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end), PlayerConnections)
-					TrackConnection(Players.PlayerRemoving:Connect(function() task.defer(refreshPlayers) end), PlayerConnections)
+					TrackConnection(Players.PlayerAdded:Connect(function() ManagedDefer(refreshPlayers) end), PlayerConnections)
+					TrackConnection(Players.PlayerRemoving:Connect(function() ManagedDefer(refreshPlayers) end), PlayerConnections)
 					TrackConnection(Dropdown.AncestryChanged:Connect(function(_, parent)
 						if parent == nil then DisconnectConnections(PlayerConnections) end
 					end), PlayerConnections)
@@ -8393,7 +8859,7 @@ function Luna:CreateWindow(WindowSettings)
 			-- Color Picker
 			function Section:CreateColorPicker(ColorPickerSettings, Flag)
 				TabPage.Position = UDim2.new(0,0,0,28)
-				local ColorPickerV = {IgnoreClass = false, Class = "Colorpicker", Settings = ColorPickerSettings}
+				local ColorPickerV = {IgnoreConfig = false, Class = "Colorpicker", Settings = ColorPickerSettings}
 
 				ColorPickerSettings = Kwargify({
 					Name = "Color Picker",
@@ -9052,7 +9518,7 @@ function Luna:CreateWindow(WindowSettings)
 			if SliderSettings.FireOnInit and IsComponentUsable(SliderV) then
 				emitCallback(SliderV.CurrentValue, true)
 			end
-			task.defer(function()
+			ManagedDefer(function()
 				if Slider.Parent then
 					setProgress(tonumber(SliderSettings.CurrentValue) or 0)
 				end
@@ -9138,7 +9604,7 @@ function Luna:CreateWindow(WindowSettings)
 				TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundColor3 = Color3.fromRGB(85, 0, 0)}):Play()
 				TweenService:Create(Toggle.UIStroke, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {Transparency = 1}):Play()
 				Toggle.Title.Text = "Callback Error"
-				task.delay(0.5, function()
+				ManagedDelay(0.5, function()
 					if not Toggle.Parent then return end
 					Toggle.Title.Text = tostring(ToggleSettings.Name)
 					TweenService:Create(Toggle, TweenInfo.new(0.7, Enum.EasingStyle.Exponential), {BackgroundTransparency = 0.5}):Play()
@@ -9321,7 +9787,7 @@ function Luna:CreateWindow(WindowSettings)
 				false,
 				true
 			)
-			task.defer(function()
+			ManagedDefer(function()
 				if not ToggleV._Destroyed then
 					NormalizeAllToggleGroups(false)
 				end
@@ -9906,8 +10372,8 @@ function Luna:CreateWindow(WindowSettings)
 					Refresh()
 					Dropdown.Selected.PlaceholderText = DropdownSettings.CurrentOption[1] or "None"
 				end
-				TrackConnection(Players.PlayerAdded:Connect(function() task.defer(refreshPlayers) end), PlayerConnections)
-				TrackConnection(Players.PlayerRemoving:Connect(function() task.defer(refreshPlayers) end), PlayerConnections)
+				TrackConnection(Players.PlayerAdded:Connect(function() ManagedDefer(refreshPlayers) end), PlayerConnections)
+				TrackConnection(Players.PlayerRemoving:Connect(function() ManagedDefer(refreshPlayers) end), PlayerConnections)
 				TrackConnection(Dropdown.AncestryChanged:Connect(function(_, parent)
 					if parent == nil then DisconnectConnections(PlayerConnections) end
 				end), PlayerConnections)
@@ -10052,7 +10518,7 @@ function Luna:CreateWindow(WindowSettings)
 
 		-- Color Picker
 		function Tab:CreateColorPicker(ColorPickerSettings, Flag)
-			local ColorPickerV = {IgnoreClass = false, Class = "Colorpicker", Settings = ColorPickerSettings}
+			local ColorPickerV = {IgnoreConfig = false, Class = "Colorpicker", Settings = ColorPickerSettings}
 
 			ColorPickerSettings = Kwargify({
 				Name = "Color Picker",
@@ -10245,7 +10711,7 @@ function Luna:CreateWindow(WindowSettings)
 			ColorPickerV._Object = ColorPicker
 			ColorPickerV = EnhanceComponent(ColorPickerV)
 			setColor(ColorPickerSettings.Color, ColorPickerSettings.FireOnInit == true, true)
-			task.defer(function() if ColorPicker.Parent then updateDisplay() end end)
+			ManagedDefer(function() if ColorPicker.Parent then updateDisplay() end end)
 			return ColorPickerV
 		end
 
@@ -10335,14 +10801,18 @@ function Luna:CreateWindow(WindowSettings)
 			local function refreshSelection(selectName, preserveSelection)
 				local options = Luna:RefreshConfigList()
 				selectName = normalizeSelection(selectName)
-
-				if not selectName and preserveSelection and selectedConfig
-					and table.find(options, selectedConfig)
-				then
-					selectName = selectedConfig
+				local function resolveName(name)
+					if not name then return nil end
+					for _, candidate in ipairs(options) do
+						if tostring(candidate):lower() == tostring(name):lower() then return candidate end
+					end
+					return nil
 				end
-				if selectName and not table.find(options, selectName) then
-					selectName = nil
+
+				if not selectName and preserveSelection and selectedConfig then
+					selectName = resolveName(selectedConfig)
+				elseif selectName then
+					selectName = resolveName(selectName)
 				end
 
 				if configBrowser then
@@ -10785,13 +11255,15 @@ function Luna:CreateWindow(WindowSettings)
 
 			-- Keep selection manual when the panel opens. Existing autoload status is
 			-- shown only in the Autoload Config paragraph until the user selects a file.
+			Luna:RepairConfigState()
 			refreshSelection(nil, false)
 			return {
 				Refresh = function(_, selectName) return refreshSelection(selectName, true) end,
 				GetSelected = function() return selectedConfig end,
 				Select = function(_, name)
-					local options = refreshSelection(name, false)
-					return table.find(options, tostring(name)) ~= nil
+					refreshSelection(name, false)
+					return selectedConfig ~= nil
+						and selectedConfig:lower() == tostring(name or ""):lower()
 				end,
 				Browser = configBrowser,
 				SetAutoloadButton = setAutoloadButton,
@@ -10997,6 +11469,9 @@ function Luna:CreateWindow(WindowSettings)
 			if type(decoded.objects) ~= "table" then
 				return false, "Config objects must be an array."
 			end
+			if #decoded.objects > math.max(1, tonumber(Luna.MaxConfigObjects) or 5000) then
+				return false, "Config contains too many objects."
+			end
 
 			local seenFlags = {}
 
@@ -11125,17 +11600,12 @@ function Luna:CreateWindow(WindowSettings)
 		end
 
 		local function SetFolder()
-			if WindowSettings.ConfigSettings.RootFolder ~= nil
-				and WindowSettings.ConfigSettings.RootFolder ~= ""
-			then
-				Luna.Folder =
-					tostring(WindowSettings.ConfigSettings.RootFolder)
-					.. "/"
-					.. tostring(WindowSettings.ConfigSettings.ConfigFolder)
-			else
-				Luna.Folder =
-					tostring(WindowSettings.ConfigSettings.ConfigFolder)
-			end
+			local configured, configuredError = JoinFolderPath(
+				WindowSettings.ConfigSettings.RootFolder,
+				WindowSettings.ConfigSettings.ConfigFolder
+			)
+			if not configured then return false, configuredError end
+			Luna.Folder = configured
 			return BuildFolderTree()
 		end
 		SetFolder()
@@ -11171,52 +11641,68 @@ function Luna:CreateWindow(WindowSettings)
 				return false, "Executor does not support writefile."
 			end
 
-			local temporary =
-				path
-				.. ".tmp-"
-				.. HttpService:GenerateGUID(false)
+			local previousContent
+			local hadPrevious = false
+			if type(isfile) == "function" and type(readfile) == "function" then
+				local existsSuccess, exists = pcall(isfile, path)
+				if existsSuccess and exists then
+					local readSuccess, raw = pcall(readfile, path)
+					if readSuccess then
+						hadPrevious = true
+						previousContent = raw
+					end
+				end
+			end
 
-			local tempSuccess, tempError =
-				pcall(writefile, temporary, content)
+			local temporary = path .. ".tmp-" .. HttpService:GenerateGUID(false)
+			local function cleanupTemporary()
+				if type(delfile) == "function" then pcall(delfile, temporary) end
+			end
+			local function restorePrevious()
+				if hadPrevious and previousContent ~= nil then
+					local success = pcall(writefile, path, previousContent)
+					if success then Luna._Stats.ConfigWriteRecoveries += 1 end
+					return success
+				end
+				if type(isfile) == "function" and type(delfile) == "function" then
+					local success, exists = pcall(isfile, path)
+					if success and exists then pcall(delfile, path) end
+				end
+				return true
+			end
+
+			local tempSuccess, tempError = pcall(writefile, temporary, content)
 			if not tempSuccess then
 				return false, tostring(tempError)
 			end
 
 			if type(readfile) == "function" then
-				local verifySuccess, verifyContent =
-					pcall(readfile, temporary)
+				local verifySuccess, verifyContent = pcall(readfile, temporary)
 				if not verifySuccess or verifyContent ~= content then
-					if type(delfile) == "function" then
-						pcall(delfile, temporary)
-					end
+					cleanupTemporary()
 					return false, "Temporary config verification failed."
 				end
 			end
 
-			local writeSuccess, writeError =
-				pcall(writefile, path, content)
+			local writeSuccess, writeError = pcall(writefile, path, content)
 			if not writeSuccess then
-				if type(delfile) == "function" then
-					pcall(delfile, temporary)
-				end
+				restorePrevious()
+				cleanupTemporary()
 				return false, tostring(writeError)
 			end
 
 			if type(readfile) == "function" then
-				local verifySuccess, verifyContent =
-					pcall(readfile, path)
+				local verifySuccess, verifyContent = pcall(readfile, path)
 				if not verifySuccess or verifyContent ~= content then
-					if type(delfile) == "function" then
-						pcall(delfile, temporary)
-					end
-					return false, "Final config verification failed."
+					local restored = restorePrevious()
+					cleanupTemporary()
+					return false, restored
+						and "Final config verification failed; previous file restored."
+						or "Final config verification failed and rollback was unsuccessful."
 				end
 			end
 
-			if type(delfile) == "function" then
-				pcall(delfile, temporary)
-			end
-
+			cleanupTemporary()
 			return true
 		end
 
@@ -11230,8 +11716,12 @@ function Luna:CreateWindow(WindowSettings)
 		end
 
 		local function DecodeJson(raw)
+			raw = tostring(raw or "")
+			if #raw > math.max(1024, tonumber(Luna.MaxConfigBytes) or (2 * 1024 * 1024)) then
+				return false, "Config JSON exceeds the maximum supported size."
+			end
 			local success, decoded =
-				pcall(HttpService.JSONDecode, HttpService, tostring(raw or ""))
+				pcall(HttpService.JSONDecode, HttpService, raw)
 			if not success then
 				return false, "Unable to decode JSON: " .. tostring(decoded)
 			end
@@ -11246,12 +11736,9 @@ function Luna:CreateWindow(WindowSettings)
 			if not folderSuccess then return false, folderError end
 
 			local createdAt = os.time()
-
-			if type(isfile) == "function"
-				and type(readfile) == "function"
-				and isfile(fullPath)
-			then
-				local oldReadSuccess, oldRaw = pcall(readfile, fullPath)
+			local existing = SafeIsFile(fullPath)
+			if existing == true then
+				local oldReadSuccess, oldRaw = SafeReadFile(fullPath)
 				if oldReadSuccess then
 					local oldDecodeSuccess, oldDecoded = DecodeJson(oldRaw)
 					if oldDecodeSuccess and type(oldDecoded) == "table" then
@@ -11277,6 +11764,9 @@ function Luna:CreateWindow(WindowSettings)
 				end
 			end
 			table.sort(flags)
+			if #flags > math.max(1, tonumber(Luna.MaxConfigObjects) or 5000) then
+				return false, "Interface has too many config options to save safely."
+			end
 
 			for _, flag in ipairs(flags) do
 				local option = Luna.Options[flag]
@@ -11332,17 +11822,10 @@ function Luna:CreateWindow(WindowSettings)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
 
-			if type(isfile) ~= "function"
-				or type(readfile) ~= "function"
-			then
-				return false, "Executor does not support config reading."
-			end
-
-			if not isfile(fullPath) then
-				return false, "Config does not exist."
-			end
-
-			local readSuccess, raw = pcall(readfile, fullPath)
+			local exists, existsError = SafeIsFile(fullPath)
+			if exists == nil then return false, existsError end
+			if not exists then return false, "Config does not exist." end
+			local readSuccess, raw = SafeReadFile(fullPath)
 			if not readSuccess then return false, tostring(raw) end
 
 			local decodeSuccess, decoded = DecodeJson(raw)
@@ -11453,14 +11936,24 @@ function Luna:CreateWindow(WindowSettings)
 
 			local function addName(name)
 				name = ConfigName(name)
-				if name and name:lower() ~= "autoload" and name:lower() ~= "nil" and not seen[name] then
-					seen[name] = true
-					table.insert(output, name)
+				if not name then return false end
+				local normalized = name:lower()
+				if normalized == "autoload" or normalized == "nil" or seen[normalized] then
+					return false
 				end
+				seen[normalized] = true
+				table.insert(output, name)
+				return true
 			end
 
 			for name in pairs(Luna._KnownConfigs or {}) do
-				addName(name)
+				local keep = true
+				if type(isfile) == "function" then
+					local path = ConfigPath(name)
+					local success, exists = path and pcall(isfile, path)
+					keep = success == true and exists == true
+				end
+				if keep then addName(name) else Luna._KnownConfigs[name] = nil end
 			end
 
 			if type(listfiles) == "function" then
@@ -11470,38 +11963,28 @@ function Luna:CreateWindow(WindowSettings)
 					if success and type(files) == "table" then
 						for _, filePath in ipairs(files) do
 							local name = tostring(filePath):match("([^/\\]+)%.json$")
-							if name then addName(name) end
+							if name and addName(name) then Luna._KnownConfigs[name] = true end
 						end
 					end
 				end
 			end
 
-			table.sort(output)
+			table.sort(output, function(a, b) return a:lower() < b:lower() end)
 			return output
 		end
 
 		function Luna:DeleteConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-
-			if type(isfile) ~= "function"
-				or type(delfile) ~= "function"
-			then
-				return false, "Executor does not support deleting files."
-			end
-
-			if not isfile(fullPath) then
-				return false, "Config does not exist."
-			end
-
-			local success, deleteError = pcall(delfile, fullPath)
+			local exists, existsError = SafeIsFile(fullPath)
+			if exists == nil then return false, existsError end
+			if not exists then return false, "Config does not exist." end
+			local success, deleteError = SafeDeleteFile(fullPath)
 			if not success then return false, tostring(deleteError) end
-
-			if self:GetAutoload() == safeName then
-				self:DeleteAutoload()
+			if self:GetAutoload() == safeName then self:DeleteAutoload() end
+			for knownName in pairs(Luna._KnownConfigs) do
+				if tostring(knownName):lower() == safeName:lower() then Luna._KnownConfigs[knownName] = nil end
 			end
-
-			Luna._KnownConfigs[safeName] = nil
 			return true, safeName
 		end
 
@@ -11534,55 +12017,49 @@ function Luna:CreateWindow(WindowSettings)
 			local newPath, safeNew = ConfigPath(newName)
 			if not oldPath then return false, safeOld end
 			if not newPath then return false, safeNew end
+			if safeOld:lower() == safeNew:lower() then return false, "New config name must be different." end
 
-			if type(readfile) ~= "function"
-				or type(writefile) ~= "function"
-				or type(delfile) ~= "function"
-				or type(isfile) ~= "function"
-			then
-				return false, "Executor does not support renaming files."
-			end
+			local oldExists, oldExistsError = SafeIsFile(oldPath)
+			if oldExists == nil then return false, oldExistsError end
+			if not oldExists then return false, "Original config does not exist." end
+			local newExists, newExistsError = SafeIsFile(newPath)
+			if newExists == nil then return false, newExistsError end
+			if newExists then return false, "A config with the new name already exists." end
 
-			if not isfile(oldPath) then
-				return false, "Original config does not exist."
-			end
-			if isfile(newPath) then
-				return false, "A config with the new name already exists."
-			end
-
-			local readSuccess, raw = pcall(readfile, oldPath)
+			local readSuccess, raw = SafeReadFile(oldPath)
 			if not readSuccess then return false, tostring(raw) end
-
 			local decodeSuccess, decoded = DecodeJson(raw)
 			if not decodeSuccess then return false, decoded end
-			local valid, validationError =
-				ValidateConfigDocument(decoded, false)
+			local valid, validationError = ValidateConfigDocument(decoded, false)
 			if not valid then return false, validationError end
 
-			local writeSuccess, writeError =
-				WriteVerifiedFile(newPath, raw)
+			local wasAutoload = self:GetAutoload() == safeOld
+			local writeSuccess, writeError = WriteVerifiedFile(newPath, raw)
 			if not writeSuccess then return false, writeError end
-
-			local deleteSuccess, deleteError =
-				pcall(delfile, oldPath)
+			local deleteSuccess, deleteError = SafeDeleteFile(oldPath)
 			if not deleteSuccess then
-				pcall(delfile, newPath)
-				return false,
-					"Rename rollback: unable to delete original config: "
-					.. tostring(deleteError)
+				SafeDeleteFile(newPath)
+				return false, "Rename rollback: unable to delete original config: " .. tostring(deleteError)
 			end
 
-			if self:GetAutoload() == safeOld then
-				local autoloadSuccess, autoloadError =
-					self:SetAutoload(safeNew)
+			if wasAutoload then
+				local autoloadSuccess, autoloadError = self:SetAutoload(safeNew)
 				if not autoloadSuccess then
-					return false,
-						"Config renamed, but autoload update failed: "
-						.. tostring(autoloadError)
+					local restoreSuccess = WriteVerifiedFile(oldPath, raw)
+					if restoreSuccess then
+						SafeDeleteFile(newPath)
+						self:SetAutoload(safeOld)
+						Luna._Stats.ConfigWriteRecoveries += 1
+					end
+					return false, restoreSuccess
+						and ("Autoload update failed; rename was rolled back: " .. tostring(autoloadError))
+						or ("Autoload update failed and rename rollback was unsuccessful: " .. tostring(autoloadError))
 				end
 			end
 
-			Luna._KnownConfigs[safeOld] = nil
+			for knownName in pairs(Luna._KnownConfigs) do
+				if tostring(knownName):lower() == safeOld:lower() then Luna._KnownConfigs[knownName] = nil end
+			end
 			Luna._KnownConfigs[safeNew] = true
 			return true, safeNew
 		end
@@ -11593,9 +12070,12 @@ function Luna:CreateWindow(WindowSettings)
 				return false, safeName
 			end
 
-			if not table.find(self:RefreshConfigList(), safeName) then
-				return false, "Config does not exist."
+			local listedName
+			for _, candidate in ipairs(self:RefreshConfigList()) do
+				if tostring(candidate):lower() == safeName:lower() then listedName = candidate; break end
 			end
+			if not listedName then return false, "Config does not exist." end
+			safeName = listedName
 
 			local data = {
 				format = AUTOLOAD_FORMAT,
@@ -11614,14 +12094,9 @@ function Luna:CreateWindow(WindowSettings)
 
 		function Luna:GetAutoload()
 			local path = AutoloadPath()
-			if type(isfile) ~= "function"
-				or type(readfile) ~= "function"
-				or not isfile(path)
-			then
-				return nil
-			end
-
-			local readSuccess, raw = pcall(readfile, path)
+			local exists = SafeIsFile(path)
+			if exists ~= true then return nil end
+			local readSuccess, raw = SafeReadFile(path)
 			if not readSuccess then return nil end
 
 			local decodeSuccess, decoded = DecodeJson(raw)
@@ -11637,28 +12112,47 @@ function Luna:CreateWindow(WindowSettings)
 			if not safeName then return nil end
 
 			local configPath = ConfigPath(safeName)
-			if type(isfile) == "function" and not isfile(configPath) then
-				return nil
-			end
+			local configExists = configPath and SafeIsFile(configPath)
+			if configExists ~= true then return nil end
 
 			return safeName
 		end
 
 		function Luna:DeleteAutoload()
 			local path = AutoloadPath()
-			if type(isfile) ~= "function"
-				or type(delfile) ~= "function"
-			then
-				return false, "Executor does not support deleting files."
-			end
+			local exists, existsError = SafeIsFile(path)
+			if exists == nil then return false, existsError end
+			if not exists then return true, "Autoload is already disabled." end
+			local success, deleteError = SafeDeleteFile(path)
+			return success, success and "Autoload deleted." or tostring(deleteError)
+		end
 
-			if not isfile(path) then
-				return true, "Autoload is already disabled."
+		function Luna:RepairConfigState()
+			local report = {RemovedTemporaryFiles = 0, RemovedStaleAutoload = false, Configs = {}}
+			local folderSuccess, folderError = BuildFolderTree()
+			if not folderSuccess then return false, folderError, report end
+			if type(listfiles) == "function" and type(delfile) == "function" then
+				local success, files = pcall(listfiles, Luna.Folder .. "/settings")
+				if success and type(files) == "table" then
+					for _, filePath in ipairs(files) do
+						if tostring(filePath):match("%.json%.tmp%-.+$") then
+							local deleted = SafeDeleteFile(filePath)
+							if deleted then report.RemovedTemporaryFiles += 1 end
+						end
+					end
+				end
 			end
-
-			local success, deleteError = pcall(delfile, path)
-			return success,
-				success and "Autoload deleted." or tostring(deleteError)
+			report.Configs = self:RefreshConfigList()
+			local autoloadPath = AutoloadPath()
+			local autoloadExists = SafeIsFile(autoloadPath)
+			if autoloadExists == true and self:GetAutoload() == nil and type(readfile) == "function" then
+				local deleted = SafeDeleteFile(autoloadPath)
+				report.RemovedStaleAutoload = deleted == true
+			end
+			local repairCount = report.RemovedTemporaryFiles + (report.RemovedStaleAutoload and 1 or 0)
+			Luna._Stats.ConfigRepairs += repairCount
+			EmitEvent("ConfigStateRepaired", report)
+			return true, report
 		end
 
 		function Luna:LoadAutoloadConfig(loadOptions)
@@ -11699,17 +12193,11 @@ function Luna:CreateWindow(WindowSettings)
 		function Luna:ExportConfig(path)
 			local fullPath, safeName = ConfigPath(path)
 			if not fullPath then return false, safeName end
-
-			if type(isfile) ~= "function"
-				or type(readfile) ~= "function"
-				or not isfile(fullPath)
-			then
-				return false, "Config does not exist."
-			end
-
-			local success, raw = pcall(readfile, fullPath)
-			return success,
-				success and raw or tostring(raw)
+			local exists, existsError = SafeIsFile(fullPath)
+			if exists == nil then return false, existsError end
+			if not exists then return false, "Config does not exist." end
+			local success, raw = SafeReadFile(fullPath)
+			return success, success and raw or tostring(raw)
 		end
 
 		function Luna:ImportConfig(path, json)
@@ -11961,11 +12449,50 @@ function Luna:CreateWindow(WindowSettings)
 	function Window:Destroy() CloseWindow() end
 	function Window:DestroyLibrary() Luna:Destroy() end
 	function Window:GetDiagnostics() return Luna:GetDiagnostics() end
+	function Window:RunSelfTest() return Luna:RunSelfTest() end
 	EnhanceWindowProductivity(Window, WindowSettings)
 	Luna._Windows[Window] = true
+	Luna._PrimaryWindow = Window
 	EmitEvent("WindowCreated", Window)
 	return Window
 end
+
+function Luna:RunSelfTest()
+	local issues = {}
+	local function issue(message) table.insert(issues, tostring(message)) end
+	if Luna._Destroyed then issue("Library is destroyed.") end
+	if typeof(LunaUI) ~= "Instance" or not LunaUI.Parent then issue("Luna UI is not parented.") end
+	if typeof(Main) ~= "Instance" or not Main.Parent then issue("SmartWindow is unavailable.") end
+	for flag, option in pairs(Luna.Options) do
+		if type(option) ~= "table" or option._Destroyed then
+			issue(("Option %q is invalid or destroyed."):format(tostring(flag)))
+		elseif option.Flag ~= flag then
+			issue(("Option %q has a mismatched Flag value."):format(tostring(flag)))
+		end
+	end
+	for connection in pairs(Luna._Connections) do
+		if typeof(connection) ~= "RBXScriptConnection" then
+			issue("Connection registry contains a non-connection value.")
+			break
+		end
+	end
+	if Luna._Stats.ActiveAsyncTasks < 0 then issue("Active async task count is invalid.") end
+	if tostring(Luna.Folder):find("%.%.", 1, true) then issue("Config folder contains a traversal segment.") end
+	for overlay in pairs(Luna._Overlays) do
+		if type(overlay) ~= "table" or overlay.Closed == true then
+			issue("Overlay registry contains an invalid or already closed handle.")
+			break
+		end
+	end
+	local owned = LunaUI:GetAttribute("LunaLibraryOwned")
+	if owned ~= true then issue("UI ownership attribute is missing.") end
+	if LunaUI:GetAttribute("LunaSessionId") ~= Luna._SessionId then issue("UI session attribute does not match the active library.") end
+	local diagnostics = Luna:GetDiagnostics()
+	diagnostics.Passed = #issues == 0
+	diagnostics.Issues = issues
+	return diagnostics.Passed, diagnostics
+end
+
 
 function Luna:Destroy()
 	if Luna._Destroyed then return end
@@ -11977,10 +12504,17 @@ function Luna:Destroy()
 	end
 	Luna._Stats.ActiveNotifications = 0
 
-	for _, cleanup in ipairs(Luna._Cleanups) do
-		pcall(cleanup)
+	local overlays = {}
+	for overlay in pairs(Luna._Overlays) do table.insert(overlays, overlay) end
+	for _, overlay in ipairs(overlays) do
+		if overlay and type(overlay.Close) == "function" then pcall(function() overlay:Close(false, {Silent = true}) end) end
 	end
+	table.clear(Luna._Overlays)
+	CancelAllTrackedTweens()
+
+	local cleanups = table.clone(Luna._Cleanups)
 	table.clear(Luna._Cleanups)
+	for index = #cleanups, 1, -1 do pcall(cleanups[index]) end
 	DisconnectConnections(Luna._Connections)
 
 	pcall(function() Main.Visible = false end)
@@ -11998,8 +12532,12 @@ function Luna:Destroy()
 	table.clear(Luna._NotificationById)
 	table.clear(Luna._Themes)
 	table.clear(Luna._Windows)
+	Luna._PrimaryWindow = nil
+	table.clear(Luna._Overlays)
+	table.clear(WarnedMessages)
 	table.clear(ActiveTweens)
 	Luna._Stats.RenderLoops = 0
+	Luna._Stats.ActiveAsyncTasks = 0
 	if rawget(GlobalEnvironment, "__LUNA_ACTIVE_LIBRARY") == Luna then
 		GlobalEnvironment.__LUNA_ACTIVE_LIBRARY = nil
 	end
