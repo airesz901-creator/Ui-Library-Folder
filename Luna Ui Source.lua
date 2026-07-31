@@ -3678,22 +3678,14 @@ local Navigation = Main.Navigation
 local Tabs = Navigation.Tabs
 local Notifications = LunaUI.Notifications
 
--- Tabs must only change through their navigation buttons. UIPageLayout
--- otherwise treats the mouse wheel, touch swipes and gamepad navigation as
--- page-change input, which can unexpectedly return the user to Home.
+-- Apply the scroll lock only after a page has been activated. Some executor
+-- environments fail to render the initial page if UIPageLayout input settings
+-- are changed before CurrentPage exists.
 local TabPageLayout = Elements:FindFirstChildOfClass("UIPageLayout")
-if TabPageLayout then
-	-- Some executor environments expose an older UIPageLayout surface.
-	-- Keep each assignment protected so one unsupported property cannot stop
-	-- the library before tab content is created.
+local function DisableTabScrollNavigation()
+	if not TabPageLayout then return end
 	pcall(function()
 		TabPageLayout.ScrollWheelInputEnabled = false
-	end)
-	pcall(function()
-		TabPageLayout.TouchInputEnabled = false
-	end)
-	pcall(function()
-		TabPageLayout.GamepadInputEnabled = false
 	end)
 end
 
@@ -6693,6 +6685,7 @@ function Luna:CreateWindow(WindowSettings)
 			tween(HomeTabButton.UIStroke, {Transparency = 0.41})
 			Elements.UIPageLayout:JumpTo(HomeTabPage)
 			task.wait(0.05)
+			DisableTabScrollNavigation()
 			for _, other in ipairs(Navigation.Tabs:GetChildren()) do
 				if other.Name ~= "InActive Template" and other.ClassName == "Frame" and other ~= HomeTabButton then
 					tween(other.ImageLabel, {ImageColor3 = Color3.fromRGB(221,221,221)})
@@ -7363,6 +7356,7 @@ function Luna:CreateWindow(WindowSettings)
 			Elements.UIPageLayout:JumpTo(TabPage)
 
 			task.wait(0.05)
+			DisableTabScrollNavigation()
 
 			for _, OtherTabButton in ipairs(Navigation.Tabs:GetChildren()) do
 				if OtherTabButton.Name ~= "InActive Template" and OtherTabButton.ClassName == "Frame" and OtherTabButton ~= TabButton then
